@@ -435,7 +435,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// single-secret mode this is a single synthetic entry under the empty
 	// ID (matches streamContext's zero-value secretID before any match).
 	secrets := opts.Secrets
-	if len(secrets) == 0 {
+	if secrets == nil {
 		secrets = map[string]Secret{"": opts.Secret}
 	}
 

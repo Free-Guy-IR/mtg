@@ -215,7 +215,11 @@ func (p ProxyOpts) valid() error {
 		return ErrLoggerIsNotDefined
 	}
 
-	if len(p.Secrets) > 0 {
+	// A non-nil-but-empty Secrets map is a legitimate multi-secret-mode state
+	// (a proxy that has started with zero users synced yet) - it must not
+	// fall through to the single-secret Secret validation below, which would
+	// wrongly require an unused Secret field to be populated too.
+	if p.Secrets != nil {
 		if p.DomainFrontingHost == "" {
 			return ErrDomainFrontingHostRequiredForMultiSecret
 		}
