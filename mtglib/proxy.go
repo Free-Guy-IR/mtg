@@ -45,13 +45,41 @@ type Proxy struct {
 	eventStream     EventStream
 	logger          Logger
 
-	// secrets and clientObfuscators are Free-Guy-IR/PasarGuard additions
-	// supporting multiple simultaneous secrets on one proxy (one entry per
-	// user). In single-secret mode (ProxyOpts.Secrets unset) both maps hold
-	// exactly one synthetic entry derived from `secret` above, so the
-	// handshake code below has a single code path regardless of mode.
-	secrets            map[string]Secret
-	clientObfuscators  map[string]obfuscation.Obfuscator
+	// secretsMu, secrets and clientObfuscators are Free-Guy-IR/PasarGuard
+	// additions supporting multiple simultaneous secrets on one proxy (one
+	// entry per user), updatable live via UpdateSecrets without restarting
+	// the proxy or dropping existing connections. In single-secret mode
+	// (ProxyOpts.Secrets unset) both maps hold exactly one synthetic entry
+	// derived from `secret` above, so the handshake code below has a single
+	// code path regardless of mode.
+	secretsMu         sync.RWMutex
+	secrets           map[string]Secret
+	clientObfuscators map[string]obfuscation.Obfuscator
+}
+
+// UpdateSecrets atomically replaces the set of secrets this proxy accepts.
+// Safe to call concurrently with connections being served; in-flight
+// handshakes read a consistent snapshot and are never interrupted by an
+// update. Free-Guy-IR/PasarGuard addition - lets a caller add/remove users
+// without restarting the proxy (unlike upstream mtg, which only supports a
+// single secret fixed at construction time).
+func (p *Proxy) UpdateSecrets(secrets map[string]Secret) {
+	clientObfuscators := make(map[string]obfuscation.Obfuscator, len(secrets))
+	for id, secret := range secrets {
+		clientObfuscators[id] = obfuscation.Obfuscator{Secret: secret.Key[:]}
+	}
+
+	p.secretsMu.Lock()
+	p.secrets = secrets
+	p.clientObfuscators = clientObfuscators
+	p.secretsMu.Unlock()
+}
+
+func (p *Proxy) secretsSnapshot() (map[string]Secret, map[string]obfuscation.Obfuscator) {
+	p.secretsMu.RLock()
+	defer p.secretsMu.RUnlock()
+
+	return p.secrets, p.clientObfuscators
 }
 
 // DomainFrontingAddress returns a host:port pair for a fronting domain.
@@ -216,9 +244,11 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		lastErr     error
 	)
 
+	secrets, _ := p.secretsSnapshot()
+
 	first := true
 
-	for id, secret := range p.secrets {
+	for id, secret := range secrets {
 		if !first {
 			rewind.Rewind()
 		}
@@ -272,7 +302,9 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
-	dc, conn, err := p.clientObfuscators[ctx.secretID].ReadHandshake(ctx.clientConn)
+	_, clientObfuscators := p.secretsSnapshot()
+
+	dc, conn, err := clientObfuscators[ctx.secretID].ReadHandshake(ctx.clientConn)
 	if err != nil {
 		return fmt.Errorf("cannot process client handshake: %w", err)
 	}
