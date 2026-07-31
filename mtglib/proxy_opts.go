@@ -1,6 +1,9 @@
 package mtglib
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ProxyOpts is a structure with settings to mtg proxy.
 //
@@ -9,8 +12,25 @@ import "time"
 type ProxyOpts struct {
 	// Secret defines a secret which should be used by a proxy.
 	//
-	// This is a mandatory setting.
+	// This is a mandatory setting, unless Secrets is populated.
 	Secret Secret
+
+	// Secrets defines a set of secrets this proxy accepts, keyed by an
+	// opaque, caller-chosen ID (e.g. a user ID). This is a
+	// Free-Guy-IR/PasarGuard addition: upstream mtg deliberately supports
+	// only a single secret per proxy. When this is non-empty, it takes
+	// priority over Secret and the proxy runs in multi-secret mode: an
+	// incoming connection is matched against every entry until one
+	// succeeds, and the matched ID is attached to the stream (surfaced via
+	// EventAuthenticated) so callers can attribute EventTraffic byte counts
+	// per secret/user.
+	//
+	// In multi-secret mode, DomainFrontingHost must be set explicitly
+	// (there is no single secret's Host to fall back on for the domain
+	// fronting decoy target).
+	//
+	// This is an optional setting.
+	Secrets map[string]Secret
 
 	// Network defines a network instance which should be used for all network
 	// communications made by proxies.
@@ -193,7 +213,23 @@ func (p ProxyOpts) valid() error {
 		return ErrEventStreamIsNotDefined
 	case p.Logger == nil:
 		return ErrLoggerIsNotDefined
-	case !p.Secret.Valid():
+	}
+
+	if len(p.Secrets) > 0 {
+		if p.DomainFrontingHost == "" {
+			return ErrDomainFrontingHostRequiredForMultiSecret
+		}
+
+		for id, secret := range p.Secrets {
+			if !secret.Valid() {
+				return fmt.Errorf("%w: id=%s", ErrSecretInvalid, id)
+			}
+		}
+
+		return nil
+	}
+
+	if !p.Secret.Valid() {
 		return ErrSecretInvalid
 	}
 

@@ -66,6 +66,22 @@ type EventFinish struct {
 	eventBase
 }
 
+// EventAuthenticated is emitted once a connection has matched one of the
+// secrets configured via ProxyOpts.Secrets (multi-secret mode) and completed
+// the obfuscated2 handshake. It is never emitted in single-secret mode.
+//
+// It lets an observer correlate later EventTraffic events (which only carry a
+// streamID) back to the secret/user that authenticated the stream, since
+// EventTraffic itself has no notion of secrets.
+//
+// This is a Free-Guy-IR/PasarGuard addition.
+type EventAuthenticated struct {
+	eventBase
+
+	// SecretID is the key of the matched entry in ProxyOpts.Secrets.
+	SecretID string
+}
+
 // EventDomainFronting is emitted when we connect to a front domain instead of
 // Telegram server.
 type EventDomainFronting struct {
@@ -144,6 +160,17 @@ func NewEventFinish(streamID string) EventFinish {
 			timestamp: time.Now(),
 			streamID:  streamID,
 		},
+	}
+}
+
+// NewEventAuthenticated creates a new EventAuthenticated event.
+func NewEventAuthenticated(streamID, secretID string) EventAuthenticated {
+	return EventAuthenticated{
+		eventBase: eventBase{
+			timestamp: time.Now(),
+			streamID:  streamID,
+		},
+		SecretID: secretID,
 	}
 }
 

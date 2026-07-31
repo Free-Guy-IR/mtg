@@ -58,6 +58,15 @@ var (
 	// ErrLoggerIsNotDefined is returned if you are trying to create a proxy but
 	// logger is not defined.
 	ErrLoggerIsNotDefined = errors.New("logger is not defined")
+
+	// ErrDomainFrontingHostRequiredForMultiSecret is returned if ProxyOpts.Secrets
+	// is populated (multi-secret mode) but DomainFrontingHost is empty. In
+	// single-secret mode the secret's own Host doubles as the domain fronting
+	// decoy target; in multi-secret mode there is no single secret to fall back
+	// on, so it must be set explicitly.
+	//
+	// This is a Free-Guy-IR/PasarGuard addition.
+	ErrDomainFrontingHostRequiredForMultiSecret = errors.New("domain fronting host is required when using multiple secrets")
 )
 
 const (

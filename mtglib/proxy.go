@@ -36,7 +36,6 @@ type Proxy struct {
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
-	clientObfuscatror           obfuscation.Obfuscator
 
 	secret          Secret
 	network         Network
@@ -45,6 +44,14 @@ type Proxy struct {
 	allowlist       IPBlocklist
 	eventStream     EventStream
 	logger          Logger
+
+	// secrets and clientObfuscators are Free-Guy-IR/PasarGuard additions
+	// supporting multiple simultaneous secrets on one proxy (one entry per
+	// user). In single-secret mode (ProxyOpts.Secrets unset) both maps hold
+	// exactly one synthetic entry derived from `secret` above, so the
+	// handshake code below has a single code path regardless of mode.
+	secrets            map[string]Secret
+	clientObfuscators  map[string]obfuscation.Obfuscator
 }
 
 // DomainFrontingAddress returns a host:port pair for a fronting domain.
@@ -102,6 +109,10 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	if err := p.doObfuscatedHandshake(ctx); err != nil {
 		ctx.logger.InfoError("obfuscated handshake is failed", err)
 		return
+	}
+
+	if ctx.secretID != "" {
+		p.eventStream.Send(ctx, NewEventAuthenticated(ctx.streamID, ctx.secretID))
 	}
 
 	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
@@ -186,17 +197,54 @@ func (p *Proxy) Shutdown() {
 	p.blocklist.Shutdown()
 }
 
+// doFakeTLSHandshake tries every configured secret against the buffered
+// ClientHello until one validates (Free-Guy-IR/PasarGuard: originally this
+// only ever tried the single p.secret). Every candidate reads from the same
+// rewindable buffer via rewind.Rewind(), which is safe because
+// fake.ReadClientHello always consumes the same fixed-format prefix
+// regardless of which secret is being checked - only the final
+// crypto/HMAC verification (done on already-buffered bytes) depends on the
+// secret, so no candidate ever needs to read past what the first attempt
+// already buffered.
 func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind := newConnRewind(ctx.clientConn)
 
-	clientHello, err := fake.ReadClientHello(
-		rewind,
-		p.secret.Key[:],
-		p.secret.Host,
-		p.tolerateTimeSkewness,
+	var (
+		clientHello *fake.ClientHello
+		matchedID   string
+		matchedKey  []byte
+		lastErr     error
 	)
-	if err != nil {
-		p.logger.InfoError("cannot read client hello", err)
+
+	first := true
+
+	for id, secret := range p.secrets {
+		if !first {
+			rewind.Rewind()
+		}
+
+		first = false
+
+		ch, err := fake.ReadClientHello(
+			rewind,
+			secret.Key[:],
+			secret.Host,
+			p.tolerateTimeSkewness,
+		)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		clientHello = ch
+		matchedID = id
+		matchedKey = secret.Key[:]
+
+		break
+	}
+
+	if matchedKey == nil {
+		p.logger.InfoError("cannot read client hello", lastErr)
 		p.doDomainFronting(ctx, rewind)
 		return false
 	}
@@ -208,10 +256,12 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return false
 	}
 
+	ctx.secretID = matchedID
+
 	gangerNoise := p.doppelGanger.NoiseParams()
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.clientConn, p.secret.Key[:], clientHello, noiseParams); err != nil {
+	if err := fake.SendServerHello(ctx.clientConn, matchedKey, clientHello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
@@ -222,7 +272,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
-	dc, conn, err := p.clientObfuscatror.ReadHandshake(ctx.clientConn)
+	dc, conn, err := p.clientObfuscators[ctx.secretID].ReadHandshake(ctx.clientConn)
 	if err != nil {
 		return fmt.Errorf("cannot process client handshake: %w", err)
 	}
@@ -348,10 +398,26 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		logger.Warning("mtglib.ProxyOpts.DomainFrontingIP is deprecated and ignored; use DomainFrontingHost instead")
 	}
 
+	// Free-Guy-IR/PasarGuard: normalize to a secrets map regardless of mode,
+	// so doFakeTLSHandshake/doObfuscatedHandshake have one code path. In
+	// single-secret mode this is a single synthetic entry under the empty
+	// ID (matches streamContext's zero-value secretID before any match).
+	secrets := opts.Secrets
+	if len(secrets) == 0 {
+		secrets = map[string]Secret{"": opts.Secret}
+	}
+
+	clientObfuscators := make(map[string]obfuscation.Obfuscator, len(secrets))
+	for id, secret := range secrets {
+		clientObfuscators[id] = obfuscation.Obfuscator{Secret: secret.Key[:]}
+	}
+
 	proxy := &Proxy{
 		ctx:                      ctx,
 		ctxCancel:                cancel,
 		secret:                   opts.Secret,
+		secrets:                  secrets,
+		clientObfuscators:        clientObfuscators,
 		network:                  opts.Network,
 		antiReplayCache:          opts.AntiReplayCache,
 		blocklist:                opts.IPBlocklist,
@@ -379,9 +445,6 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			updatersLogger.Named("public-config"),
 			opts.Network.MakeHTTPClient(nil),
 		),
-		clientObfuscatror: obfuscation.Obfuscator{
-			Secret: opts.Secret.Key[:],
-		},
 		domainFrontingProxyProtocol: opts.DomainFrontingProxyProtocol,
 	}
 

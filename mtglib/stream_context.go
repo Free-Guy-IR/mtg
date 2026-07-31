@@ -18,6 +18,12 @@ type streamContext struct {
 	streamID     string
 	dc           int
 	logger       Logger
+
+	// secretID is the key of the entry in Proxy.secrets that matched this
+	// stream's ClientHello, set by doFakeTLSHandshake. Empty until a match
+	// happens (and stays empty for streams that fall back to domain
+	// fronting). Free-Guy-IR/PasarGuard addition.
+	secretID string
 }
 
 func (s *streamContext) Deadline() (time.Time, bool) {
