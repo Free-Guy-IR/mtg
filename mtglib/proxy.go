@@ -274,7 +274,14 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	}
 
 	if matchedKey == nil {
-		p.logger.InfoError("cannot read client hello", lastErr)
+		if lastErr == nil {
+			// No secrets configured at all (e.g. a proxy that has started with
+			// zero users synced yet) - every connection takes this path, not
+			// just malformed ones, so this is Info, not a real failure.
+			p.logger.Info("cannot read client hello: no secrets configured")
+		} else {
+			p.logger.InfoError("cannot read client hello", lastErr)
+		}
 		p.doDomainFronting(ctx, rewind)
 		return false
 	}
