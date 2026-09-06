@@ -21,9 +21,6 @@ func (f *fakeConn) SetWriteDeadline(t time.Time) error { return nil }
 func (f *fakeConn) CloseRead() error                   { return nil }
 func (f *fakeConn) CloseWrite() error                  { return nil }
 
-// A proxy holding many secrets rewinds once per secret while it looks for the
-// one that matches a client hello. Every one of those attempts has to see the
-// same bytes, so a rewind must not consume what it replays.
 func TestConnRewindReplaysManyTimes(t *testing.T) {
 	payload := []byte("CLIENT-HELLO-PAYLOAD-0123456789")
 
