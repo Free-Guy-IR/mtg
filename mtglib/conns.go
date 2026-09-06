@@ -54,7 +54,7 @@ func (c *connRewind) Read(p []byte) (int, error) {
 }
 
 func (c *connRewind) Rewind() {
-	c.active = io.MultiReader(&c.buf, c.Conn)
+	c.active = io.MultiReader(bytes.NewReader(c.buf.Bytes()), io.TeeReader(c.Conn, &c.buf))
 }
 
 func newConnRewind(conn essentials.Conn) *connRewind {
