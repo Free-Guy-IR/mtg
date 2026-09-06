@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -66,15 +67,44 @@ type Proxy struct {
 // without restarting the proxy (unlike upstream mtg, which only supports a
 // single secret fixed at construction time).
 func (p *Proxy) UpdateSecrets(secrets map[string]Secret) {
-	clientObfuscators := make(map[string]obfuscation.Obfuscator, len(secrets))
-	for id, secret := range secrets {
+	unique, dropped := dedupeSecrets(secrets)
+	for _, id := range dropped {
+		p.logger.Warning("secret shares its key with another user and was ignored: " + id)
+	}
+
+	clientObfuscators := make(map[string]obfuscation.Obfuscator, len(unique))
+	for id, secret := range unique {
 		clientObfuscators[id] = obfuscation.Obfuscator{Secret: secret.Key[:]}
 	}
 
 	p.secretsMu.Lock()
-	p.secrets = secrets
+	p.secrets = unique
 	p.clientObfuscators = clientObfuscators
 	p.secretsMu.Unlock()
+}
+
+func dedupeSecrets(secrets map[string]Secret) (map[string]Secret, []string) {
+	ids := make([]string, 0, len(secrets))
+	for id := range secrets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	seen := make(map[[SecretKeyLength]byte]struct{}, len(secrets))
+	unique := make(map[string]Secret, len(secrets))
+	dropped := []string{}
+
+	for _, id := range ids {
+		secret := secrets[id]
+		if _, dup := seen[secret.Key]; dup {
+			dropped = append(dropped, id)
+			continue
+		}
+		seen[secret.Key] = struct{}{}
+		unique[id] = secret
+	}
+
+	return unique, dropped
 }
 
 func (p *Proxy) secretsSnapshot() (map[string]Secret, map[string]obfuscation.Obfuscator) {
@@ -490,6 +520,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	secrets := opts.Secrets
 	if secrets == nil {
 		secrets = map[string]Secret{"": opts.Secret}
+	}
+
+	secrets, dropped := dedupeSecrets(secrets)
+	for _, id := range dropped {
+		logger.Warning("secret shares its key with another user and was ignored: " + id)
 	}
 
 	clientObfuscators := make(map[string]obfuscation.Obfuscator, len(secrets))
