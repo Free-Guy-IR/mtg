@@ -197,6 +197,8 @@ type ProxyOpts struct {
 
 	// DoppelGangerDRS defines if TLS Dynamic Record Sizing is active.
 	DoppelGangerDRS bool
+
+	PlainMode bool
 }
 
 func (p ProxyOpts) valid() error {
@@ -220,6 +222,16 @@ func (p ProxyOpts) valid() error {
 	// fall through to the single-secret Secret validation below, which would
 	// wrongly require an unused Secret field to be populated too.
 	if p.Secrets != nil {
+		if p.PlainMode {
+			for id, secret := range p.Secrets {
+				if secret.Key == secretEmptyKey {
+					return fmt.Errorf("%w: id=%s", ErrSecretInvalid, id)
+				}
+			}
+
+			return nil
+		}
+
 		if p.DomainFrontingHost == "" {
 			return ErrDomainFrontingHostRequiredForMultiSecret
 		}

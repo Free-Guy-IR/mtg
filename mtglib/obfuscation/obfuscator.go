@@ -55,6 +55,36 @@ func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, erro
 
 // SendHandshake writes a fresh 64-byte obfuscated2 handshake for the given
 // DC to w and returns a transparent en/decrypting wrapper over w.
+func ReadHandshakeFrame(r io.Reader) ([hfLen]byte, error) {
+	frame := handshakeFrame{}
+	if _, err := io.ReadFull(r, frame.data[:]); err != nil {
+		return frame.data, fmt.Errorf("cannot read frame: %w", err)
+	}
+
+	return frame.data, nil
+}
+
+func (o Obfuscator) HandshakeFromFrame(data [hfLen]byte, r essentials.Conn) (int, essentials.Conn, bool) {
+	frame := handshakeFrame{data: data}
+
+	hasher := sha256.New()
+	recvCipher := o.getCipher(&frame, hasher)
+
+	frame.revert()
+	hasher.Reset()
+
+	sendCipher := o.getCipher(&frame, hasher)
+	frame.revert()
+
+	recvCipher.XORKeyStream(frame.data[:], frame.data[:])
+
+	if subtle.ConstantTimeCompare(frame.connectionType(), hfConnectionType[:]) != 1 {
+		return 0, nil, false
+	}
+
+	return frame.dc(), conn{Conn: r, recvCipher: recvCipher, sendCipher: sendCipher}, true
+}
+
 func (o Obfuscator) SendHandshake(w essentials.Conn, dc int) (essentials.Conn, error) {
 	frame := generateHandshake(dc)
 	copyFrame := frame

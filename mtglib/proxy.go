@@ -12,10 +12,10 @@ import (
 	"github.com/9seconds/mtg/v2/essentials"
 	"github.com/9seconds/mtg/v2/mtglib/internal/dc"
 	"github.com/9seconds/mtg/v2/mtglib/internal/doppel"
-	"github.com/9seconds/mtg/v2/mtglib/obfuscation"
 	"github.com/9seconds/mtg/v2/mtglib/internal/relay"
 	"github.com/9seconds/mtg/v2/mtglib/internal/tls"
 	"github.com/9seconds/mtg/v2/mtglib/internal/tls/fake"
+	"github.com/9seconds/mtg/v2/mtglib/obfuscation"
 	"github.com/panjf2000/ants/v2"
 )
 
@@ -33,6 +33,7 @@ type Proxy struct {
 	domainFrontingHost          string
 	domainFrontingProxyProtocol bool
 	workerPool                  *ants.PoolWithFunc
+	plainMode                   bool
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
@@ -121,22 +122,29 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		ctx.logger.Info("Stream has been finished")
 	}()
 
-	if !p.doFakeTLSHandshake(ctx) {
-		return
-	}
+	if p.plainMode {
+		if err := p.doPlainHandshake(ctx); err != nil {
+			ctx.logger.InfoError("plain handshake is failed", err)
+			return
+		}
+	} else {
+		if !p.doFakeTLSHandshake(ctx) {
+			return
+		}
 
-	clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
-	if err != nil {
-		ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
-		return
-	}
-	defer clientConn.Stop()
+		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+		if err != nil {
+			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
+			return
+		}
+		defer clientConn.Stop()
 
-	ctx.clientConn = clientConn
+		ctx.clientConn = clientConn
 
-	if err := p.doObfuscatedHandshake(ctx); err != nil {
-		ctx.logger.InfoError("obfuscated handshake is failed", err)
-		return
+		if err := p.doObfuscatedHandshake(ctx); err != nil {
+			ctx.logger.InfoError("obfuscated handshake is failed", err)
+			return
+		}
 	}
 
 	if ctx.secretID != "" {
@@ -323,6 +331,31 @@ func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	return nil
 }
 
+func (p *Proxy) doPlainHandshake(ctx *streamContext) error {
+	frame, err := obfuscation.ReadHandshakeFrame(ctx.clientConn)
+	if err != nil {
+		return fmt.Errorf("cannot read client handshake: %w", err)
+	}
+
+	_, clientObfuscators := p.secretsSnapshot()
+
+	for id, obf := range clientObfuscators {
+		dc, conn, ok := obf.HandshakeFromFrame(frame, ctx.clientConn)
+		if !ok {
+			continue
+		}
+
+		ctx.secretID = id
+		ctx.dc = dc
+		ctx.clientConn = conn
+		ctx.logger = ctx.logger.BindInt("dc", dc)
+
+		return nil
+	}
+
+	return ErrNoSecretMatched
+}
+
 func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 	dcid := ctx.dc
 
@@ -465,6 +498,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		logger:                   logger,
 		domainFrontingPort:       opts.getDomainFrontingPort(),
 		domainFrontingHost:       opts.DomainFrontingHost,
+		plainMode:                opts.PlainMode,
 		tolerateTimeSkewness:     opts.getTolerateTimeSkewness(),
 		idleTimeout:              opts.getIdleTimeout(),
 		handshakeTimeout:         opts.getHandshakeTimeout(),

@@ -35,6 +35,8 @@ var (
 	// value is invalid (no host or payload are zeroes).
 	ErrSecretInvalid = errors.New("secret is invalid")
 
+	ErrNoSecretMatched = errors.New("no secret matched the client handshake")
+
 	// ErrNetworkIsNotDefined is returned if you are trying to create a proxy but
 	// network value is undefined.
 	ErrNetworkIsNotDefined = errors.New("network is not defined")
