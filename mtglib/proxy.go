@@ -34,6 +34,7 @@ type Proxy struct {
 	domainFrontingProxyProtocol bool
 	workerPool                  *ants.PoolWithFunc
 	plainMode                   bool
+	authFailures                *authFailureLimiter
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
@@ -114,6 +115,11 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	})
 	defer stop()
 
+	if p.authFailures.blocked(ctx.ClientIP()) {
+		ctx.logger.Info("client ip is throttled after repeated failed handshakes")
+		return
+	}
+
 	p.eventStream.Send(ctx, NewEventStart(ctx.streamID, ctx.ClientIP()))
 	ctx.logger.Info("Stream has been started")
 
@@ -124,11 +130,13 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	if p.plainMode {
 		if err := p.doPlainHandshake(ctx); err != nil {
+			p.authFailures.record(ctx.ClientIP())
 			ctx.logger.InfoError("plain handshake is failed", err)
 			return
 		}
 	} else {
 		if !p.doFakeTLSHandshake(ctx) {
+			p.authFailures.record(ctx.ClientIP())
 			return
 		}
 
@@ -337,6 +345,11 @@ func (p *Proxy) doPlainHandshake(ctx *streamContext) error {
 		return fmt.Errorf("cannot read client handshake: %w", err)
 	}
 
+	if p.antiReplayCache.SeenBefore(frame[8:56]) {
+		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
+		return ErrReplayAttack
+	}
+
 	_, clientObfuscators := p.secretsSnapshot()
 
 	for id, obf := range clientObfuscators {
@@ -499,6 +512,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		domainFrontingPort:       opts.getDomainFrontingPort(),
 		domainFrontingHost:       opts.DomainFrontingHost,
 		plainMode:                opts.PlainMode,
+		authFailures:             newAuthFailureLimiter(authFailureLimit, authFailureWindow, authFailureMaxIPs),
 		tolerateTimeSkewness:     opts.getTolerateTimeSkewness(),
 		idleTimeout:              opts.getIdleTimeout(),
 		handshakeTimeout:         opts.getHandshakeTimeout(),

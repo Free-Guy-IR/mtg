@@ -70,19 +70,18 @@ func (o Obfuscator) HandshakeFromFrame(data [hfLen]byte, r essentials.Conn) (int
 	hasher := sha256.New()
 	recvCipher := o.getCipher(&frame, hasher)
 
-	frame.revert()
-	hasher.Reset()
+	decrypted := handshakeFrame{data: data}
+	recvCipher.XORKeyStream(decrypted.data[:], decrypted.data[:])
 
-	sendCipher := o.getCipher(&frame, hasher)
-	frame.revert()
-
-	recvCipher.XORKeyStream(frame.data[:], frame.data[:])
-
-	if subtle.ConstantTimeCompare(frame.connectionType(), hfConnectionType[:]) != 1 {
+	if subtle.ConstantTimeCompare(decrypted.connectionType(), hfConnectionType[:]) != 1 {
 		return 0, nil, false
 	}
 
-	return frame.dc(), conn{Conn: r, recvCipher: recvCipher, sendCipher: sendCipher}, true
+	frame.revert()
+	hasher.Reset()
+	sendCipher := o.getCipher(&frame, hasher)
+
+	return decrypted.dc(), conn{Conn: r, recvCipher: recvCipher, sendCipher: sendCipher}, true
 }
 
 func (o Obfuscator) SendHandshake(w essentials.Conn, dc int) (essentials.Conn, error) {

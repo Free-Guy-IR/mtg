@@ -37,6 +37,8 @@ var (
 
 	ErrNoSecretMatched = errors.New("no secret matched the client handshake")
 
+	ErrReplayAttack = errors.New("replayed client handshake")
+
 	// ErrNetworkIsNotDefined is returned if you are trying to create a proxy but
 	// network value is undefined.
 	ErrNetworkIsNotDefined = errors.New("network is not defined")
