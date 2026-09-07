@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -71,8 +72,20 @@ func ParseClientHello(conn net.Conn) (*ParsedHello, error) {
 	}, nil
 }
 
+func CanonicalHostname(hostname string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+}
+
 func (p *ParsedHello) HasHostname(hostname string) bool {
-	return slices.Contains(p.SNINames, hostname)
+	want := CanonicalHostname(hostname)
+
+	for _, name := range p.SNINames {
+		if CanonicalHostname(name) == want {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *ParsedHello) Verify(secret []byte, tolerateTimeSkewness time.Duration) error {

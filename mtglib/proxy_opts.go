@@ -2,7 +2,7 @@ package mtglib
 
 import (
 	"fmt"
-	"slices"
+	"github.com/9seconds/mtg/v2/mtglib/internal/tls/fake"
 	"time"
 )
 
@@ -206,7 +206,12 @@ type ProxyOpts struct {
 
 func (p ProxyOpts) fakeTLSHostnames() []string {
 	if len(p.FakeTLSDomains) > 0 {
-		return slices.Clone(p.FakeTLSDomains)
+		out := make([]string, 0, len(p.FakeTLSDomains))
+		for _, d := range p.FakeTLSDomains {
+			out = append(out, fake.CanonicalHostname(d))
+		}
+
+		return out
 	}
 
 	if p.DomainFrontingHost != "" {

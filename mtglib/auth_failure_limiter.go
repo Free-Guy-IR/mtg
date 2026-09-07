@@ -7,30 +7,34 @@ import (
 )
 
 const (
-	authFailureLimit  = 5000
-	authFailureWindow = time.Minute
-	authFailureMaxIPs = 65536
+	authFailureCheapLimit  = 5000
+	authFailureCostlyLimit = 200
+	authFailureWindow      = time.Minute
+	authFailureMaxIPs      = 65536
 )
 
 type authFailureEntry struct {
-	count       int
+	cheap       int
+	costly      int
 	windowStart time.Time
 }
 
 type authFailureLimiter struct {
-	mu     sync.Mutex
-	limit  int
-	window time.Duration
-	maxIPs int
-	byIP   map[string]*authFailureEntry
+	mu          sync.Mutex
+	cheapLimit  int
+	costlyLimit int
+	window      time.Duration
+	maxIPs      int
+	byIP        map[string]*authFailureEntry
 }
 
-func newAuthFailureLimiter(limit int, window time.Duration, maxIPs int) *authFailureLimiter {
+func newAuthFailureLimiter(cheapLimit, costlyLimit int, window time.Duration, maxIPs int) *authFailureLimiter {
 	return &authFailureLimiter{
-		limit:  limit,
-		window: window,
-		maxIPs: maxIPs,
-		byIP:   make(map[string]*authFailureEntry),
+		cheapLimit:  cheapLimit,
+		costlyLimit: costlyLimit,
+		window:      window,
+		maxIPs:      maxIPs,
+		byIP:        make(map[string]*authFailureEntry),
 	}
 }
 
@@ -48,13 +52,14 @@ func (l *authFailureLimiter) blocked(ip net.IP) bool {
 
 	if now.Sub(entry.windowStart) > l.window {
 		delete(l.byIP, key)
+
 		return false
 	}
 
-	return entry.count >= l.limit
+	return entry.cheap >= l.cheapLimit || entry.costly >= l.costlyLimit
 }
 
-func (l *authFailureLimiter) record(ip net.IP) {
+func (l *authFailureLimiter) record(ip net.IP, costly bool) {
 	key := ip.String()
 	now := time.Now()
 
@@ -69,13 +74,21 @@ func (l *authFailureLimiter) record(ip net.IP) {
 					delete(l.byIP, k)
 				}
 			}
+
 			if len(l.byIP) >= l.maxIPs {
 				return
 			}
 		}
-		l.byIP[key] = &authFailureEntry{count: 1, windowStart: now}
+
+		entry = &authFailureEntry{windowStart: now}
+		l.byIP[key] = entry
+	}
+
+	if costly {
+		entry.costly++
+
 		return
 	}
 
-	entry.count++
+	entry.cheap++
 }

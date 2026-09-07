@@ -161,13 +161,16 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	if p.plainMode {
 		if err := p.doPlainHandshake(ctx); err != nil {
-			p.authFailures.record(ctx.ClientIP())
+			p.authFailures.record(ctx.ClientIP(), !errors.Is(err, ErrReplayAttack))
 			ctx.logger.InfoError("plain handshake is failed", err)
+
 			return
 		}
 	} else {
-		if !p.doFakeTLSHandshake(ctx) {
-			p.authFailures.record(ctx.ClientIP())
+		ok, costly := p.doFakeTLSHandshake(ctx)
+		if !ok {
+			p.authFailures.record(ctx.ClientIP(), costly)
+
 			return
 		}
 
@@ -281,7 +284,7 @@ func (p *Proxy) Shutdown() {
 // crypto/HMAC verification (done on already-buffered bytes) depends on the
 // secret, so no candidate ever needs to read past what the first attempt
 // already buffered.
-func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
+func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) (bool, bool) {
 	rewind := newConnRewind(ctx.clientConn)
 
 	var (
@@ -298,19 +301,21 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		p.logger.InfoError("cannot read client hello", err)
 		p.doDomainFronting(ctx, rewind)
 
-		return false
+		return false, false
 	}
 
 	if !p.hostnameAllowed(parsed) {
 		p.logger.Info("client hello carries no configured fake-tls hostname")
 		p.doDomainFronting(ctx, rewind)
 
-		return false
+		return false, false
 	}
 
 	for id, secret := range secrets {
 		if err := parsed.Verify(secret.Key[:], p.tolerateTimeSkewness); err != nil {
-			lastErr = err
+			if lastErr == nil || errors.Is(lastErr, fake.ErrBadDigest) {
+				lastErr = err
+			}
 
 			continue
 		}
@@ -332,14 +337,16 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 			p.logger.InfoError("cannot read client hello", lastErr)
 		}
 		p.doDomainFronting(ctx, rewind)
-		return false
+
+		return false, true
 	}
 
 	if p.antiReplayCache.SeenBefore(clientHello.SessionID) {
 		p.logger.Warning("replay attack has been detected!")
 		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
 		p.doDomainFronting(ctx, rewind)
-		return false
+
+		return false, false
 	}
 
 	ctx.secretID = matchedID
@@ -349,12 +356,13 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 
 	if err := fake.SendServerHello(ctx.clientConn, matchedKey, clientHello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
-		return false
+
+		return false, false
 	}
 
 	ctx.clientConn = tls.New(ctx.clientConn, true, false)
 
-	return true
+	return true, false
 }
 
 func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
@@ -561,7 +569,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		domainFrontingHost:       opts.DomainFrontingHost,
 		plainMode:                opts.PlainMode,
 		fakeTLSDomains:           opts.fakeTLSHostnames(),
-		authFailures:             newAuthFailureLimiter(authFailureLimit, authFailureWindow, authFailureMaxIPs),
+		authFailures:             newAuthFailureLimiter(authFailureCheapLimit, authFailureCostlyLimit, authFailureWindow, authFailureMaxIPs),
 		tolerateTimeSkewness:     opts.getTolerateTimeSkewness(),
 		idleTimeout:              opts.getIdleTimeout(),
 		handshakeTimeout:         opts.getHandshakeTimeout(),
