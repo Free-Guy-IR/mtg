@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	authFailureLimit  = 20
+	authFailureLimit  = 5000
 	authFailureWindow = time.Minute
 	authFailureMaxIPs = 65536
 )

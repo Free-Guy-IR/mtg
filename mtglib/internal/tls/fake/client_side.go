@@ -42,6 +42,68 @@ type ClientHello struct {
 	CipherSuite uint16
 }
 
+type ParsedHello struct {
+	Hello     *ClientHello
+	SNINames  []string
+	helloCopy []byte
+}
+
+func ParseClientHello(conn net.Conn) (*ParsedHello, error) {
+	clientHelloCopy, handshakeReader, err := parseClientHello(conn)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read client hello: %w", err)
+	}
+
+	hello, err := parseHandshake(handshakeReader)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse handshake: %w", err)
+	}
+
+	sniHostnames, err := parseSNI(handshakeReader)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse SNI: %w", err)
+	}
+
+	return &ParsedHello{
+		Hello:     hello,
+		SNINames:  sniHostnames,
+		helloCopy: clientHelloCopy.Bytes(),
+	}, nil
+}
+
+func (p *ParsedHello) HasHostname(hostname string) bool {
+	return slices.Contains(p.SNINames, hostname)
+}
+
+func (p *ParsedHello) Verify(secret []byte, tolerateTimeSkewness time.Duration) error {
+	clientHelloCopy := bytes.NewBuffer(p.helloCopy)
+
+	digest := hmac.New(sha256.New, secret)
+	digest.Write(clientHelloCopy.Next(RandomOffset))
+	clientHelloCopy.Next(RandomLen)
+	digest.Write(emptyRandom[:])
+	digest.Write(clientHelloCopy.Bytes())
+
+	computed := digest.Sum(nil)
+
+	for i := range RandomLen {
+		computed[i] ^= p.Hello.Random[i]
+	}
+
+	if subtle.ConstantTimeCompare(emptyRandom[:RandomLen-4], computed[:RandomLen-4]) != 1 {
+		return ErrBadDigest
+	}
+
+	timestamp := int64(binary.LittleEndian.Uint32(computed[RandomLen-4:]))
+	createdAt := time.Unix(timestamp, 0)
+
+	if tdiff := time.Since(createdAt).Abs(); tdiff > tolerateTimeSkewness {
+		return fmt.Errorf("timestamp %q is too old %s", createdAt, tdiff)
+	}
+
+	return nil
+}
+
 func ReadClientHello(
 	conn net.Conn,
 	secret []byte,

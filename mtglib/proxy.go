@@ -35,6 +35,7 @@ type Proxy struct {
 	domainFrontingProxyProtocol bool
 	workerPool                  *ants.PoolWithFunc
 	plainMode                   bool
+	fakeTLSDomains              []string
 	authFailures                *authFailureLimiter
 	telegram                    *dc.Telegram
 	configUpdater               *dc.PublicConfigUpdater
@@ -292,27 +293,29 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 
 	secrets, _ := p.secretsSnapshot()
 
-	first := true
+	parsed, err := fake.ParseClientHello(rewind)
+	if err != nil {
+		p.logger.InfoError("cannot read client hello", err)
+		p.doDomainFronting(ctx, rewind)
+
+		return false
+	}
+
+	if !p.hostnameAllowed(parsed) {
+		p.logger.Info("client hello carries no configured fake-tls hostname")
+		p.doDomainFronting(ctx, rewind)
+
+		return false
+	}
 
 	for id, secret := range secrets {
-		if !first {
-			rewind.Rewind()
-		}
-
-		first = false
-
-		ch, err := fake.ReadClientHello(
-			rewind,
-			secret.Key[:],
-			secret.Host,
-			p.tolerateTimeSkewness,
-		)
-		if err != nil {
+		if err := parsed.Verify(secret.Key[:], p.tolerateTimeSkewness); err != nil {
 			lastErr = err
+
 			continue
 		}
 
-		clientHello = ch
+		clientHello = parsed.Hello
 		matchedID = id
 		matchedKey = secret.Key[:]
 
@@ -367,6 +370,16 @@ func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 	ctx.logger = ctx.logger.BindInt("dc", dc)
 
 	return nil
+}
+
+func (p *Proxy) hostnameAllowed(parsed *fake.ParsedHello) bool {
+	for _, host := range p.fakeTLSDomains {
+		if parsed.HasHostname(host) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (p *Proxy) doPlainHandshake(ctx *streamContext) error {
@@ -547,6 +560,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		domainFrontingPort:       opts.getDomainFrontingPort(),
 		domainFrontingHost:       opts.DomainFrontingHost,
 		plainMode:                opts.PlainMode,
+		fakeTLSDomains:           opts.fakeTLSHostnames(),
 		authFailures:             newAuthFailureLimiter(authFailureLimit, authFailureWindow, authFailureMaxIPs),
 		tolerateTimeSkewness:     opts.getTolerateTimeSkewness(),
 		idleTimeout:              opts.getIdleTimeout(),

@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -199,6 +200,24 @@ type ProxyOpts struct {
 	DoppelGangerDRS bool
 
 	PlainMode bool
+
+	FakeTLSDomains []string
+}
+
+func (p ProxyOpts) fakeTLSHostnames() []string {
+	if len(p.FakeTLSDomains) > 0 {
+		return slices.Clone(p.FakeTLSDomains)
+	}
+
+	if p.DomainFrontingHost != "" {
+		return []string{p.DomainFrontingHost}
+	}
+
+	if p.Secret.Host != "" {
+		return []string{p.Secret.Host}
+	}
+
+	return nil
 }
 
 func (p ProxyOpts) valid() error {
@@ -222,6 +241,16 @@ func (p ProxyOpts) valid() error {
 	// fall through to the single-secret Secret validation below, which would
 	// wrongly require an unused Secret field to be populated too.
 	if p.Secrets != nil {
+		if len(p.FakeTLSDomains) > 0 {
+			for id, secret := range p.Secrets {
+				if secret.Key == secretEmptyKey {
+					return fmt.Errorf("%w: id=%s", ErrSecretInvalid, id)
+				}
+			}
+
+			return nil
+		}
+
 		if p.PlainMode {
 			for id, secret := range p.Secrets {
 				if secret.Key == secretEmptyKey {
