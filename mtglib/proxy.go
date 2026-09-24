@@ -24,6 +24,8 @@ import (
 type Proxy struct {
 	ctx             context.Context
 	ctxCancel       context.CancelFunc
+	streamsMu       sync.Mutex
+	streamsClosed   bool
 	streamWaitGroup sync.WaitGroup
 
 	allowFallbackOnUnknownDC    bool
@@ -130,9 +132,30 @@ func (p *Proxy) DomainFrontingAddress() string {
 // ServeConn serves a connection. We do not check IP blocklist and concurrency
 // limit here.
 func (p *Proxy) ServeConn(conn essentials.Conn) {
-	p.streamWaitGroup.Add(1)
+	if !p.trackStream() {
+		conn.Close() //nolint: errcheck
+
+		return
+	}
 	defer p.streamWaitGroup.Done()
 
+	p.serveConn(conn)
+}
+
+func (p *Proxy) trackStream() bool {
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+
+	if p.streamsClosed {
+		return false
+	}
+
+	p.streamWaitGroup.Add(1)
+
+	return true
+}
+
+func (p *Proxy) serveConn(conn essentials.Conn) {
 	ctx := newStreamContext(p.ctx, p.logger, conn)
 	defer ctx.Close()
 
@@ -215,7 +238,9 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 // Serve starts a proxy on a given listener.
 func (p *Proxy) Serve(listener net.Listener) error {
-	p.streamWaitGroup.Add(1)
+	if !p.trackStream() {
+		return nil
+	}
 	defer p.streamWaitGroup.Done()
 
 	for {
@@ -248,16 +273,28 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			continue
 		}
 
+		if !p.trackStream() {
+			conn.Close() //nolint: errcheck
+
+			return nil
+		}
+
 		err = p.workerPool.Invoke(conn)
+		if err == nil {
+			continue
+		}
+
+		conn.Close() //nolint: errcheck
+		p.streamWaitGroup.Done()
 
 		switch {
-		case err == nil:
 		case errors.Is(err, ants.ErrPoolClosed):
 			return nil
 		case errors.Is(err, ants.ErrPoolOverload):
-			conn.Close() //nolint: errcheck
 			logger.Info("connection was concurrency limited")
 			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
+		default:
+			logger.WarningError("cannot hand the connection to a worker", err)
 		}
 	}
 }
@@ -265,6 +302,10 @@ func (p *Proxy) Serve(listener net.Listener) error {
 // Shutdown 'gracefully' shutdowns all connections. Please remember that it
 // does not close an underlying listener.
 func (p *Proxy) Shutdown() {
+	p.streamsMu.Lock()
+	p.streamsClosed = true
+	p.streamsMu.Unlock()
+
 	p.ctxCancel()
 	p.streamWaitGroup.Wait()
 	p.workerPool.Release()
@@ -601,7 +642,9 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),
 		func(arg any) {
-			proxy.ServeConn(arg.(essentials.Conn)) //nolint: forcetypeassert
+			defer proxy.streamWaitGroup.Done()
+
+			proxy.serveConn(arg.(essentials.Conn)) //nolint: forcetypeassert
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))
