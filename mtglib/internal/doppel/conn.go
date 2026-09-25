@@ -3,10 +3,12 @@ package doppel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/mtglib/internal/recovery"
 	"github.com/9seconds/mtg/v2/mtglib/internal/tls"
 )
 
@@ -18,6 +20,8 @@ var doppelBufPool = sync.Pool{
 }
 
 var beforeWrittenRead = func() {}
+
+var errWriterPanicked = errors.New("doppelganger writer panicked")
 
 type Conn struct {
 	essentials.Conn
@@ -67,14 +71,7 @@ func (c Conn) start() {
 
 		size := c.p.stats.Size()
 
-		c.p.writtenCond.L.Lock()
-		for c.p.writeStream.Len() == 0 && !c.p.done {
-			c.p.writtenCond.Wait()
-		}
-		beforeWrittenRead()
-		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
-		c.p.writtenCond.L.Unlock()
-
+		n := c.takeWritten(buf[tls.SizeHeader : tls.SizeHeader+size])
 		if n == 0 {
 			continue
 		}
@@ -84,6 +81,26 @@ func (c Conn) start() {
 			return
 		}
 	}
+}
+
+func (c Conn) takeWritten(buf []byte) int {
+	c.p.writtenCond.L.Lock()
+	defer c.p.writtenCond.L.Unlock()
+
+	for c.p.writeStream.Len() == 0 && !c.p.done {
+		c.p.writtenCond.Wait()
+	}
+
+	beforeWrittenRead()
+
+	n, _ := c.p.writeStream.Read(buf)
+
+	return n
+}
+
+func (c Conn) abandon() {
+	c.p.ctxCancel(errWriterPanicked)
+	c.Conn.Close() //nolint: errcheck
 }
 
 func (c Conn) Stop() {
@@ -97,7 +114,7 @@ func (c Conn) Stop() {
 	c.p.wg.Wait()
 }
 
-func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
+func NewConn(ctx context.Context, logger Logger, conn essentials.Conn, stats Stats) Conn {
 	ctx, cancel := context.WithCancelCause(ctx)
 	rv := Conn{
 		Conn: conn,
@@ -114,6 +131,8 @@ func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
 	rv.p.writeStream.Grow(tls.DefaultBufferSize)
 
 	rv.p.wg.Go(func() {
+		defer recovery.Guard(logger, "doppelganger writer", rv.abandon)
+
 		rv.start()
 	})
 

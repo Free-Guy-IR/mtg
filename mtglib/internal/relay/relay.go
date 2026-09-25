@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/mtglib/internal/recovery"
 )
 
 func Relay(ctx context.Context, log Logger, telegramConn, clientConn essentials.Conn) {
@@ -16,8 +17,10 @@ func Relay(ctx context.Context, log Logger, telegramConn, clientConn essentials.
 	defer cancel()
 
 	stop := context.AfterFunc(ctx, func() {
+		defer recovery.Guard(log, "relay close")
+		defer clientConn.Close() //nolint: errcheck
+
 		telegramConn.Close() //nolint: errcheck
-		clientConn.Close()   //nolint: errcheck
 	})
 	defer stop()
 
@@ -25,6 +28,10 @@ func Relay(ctx context.Context, log Logger, telegramConn, clientConn essentials.
 
 	go func() {
 		defer close(closeChan)
+		defer recovery.Guard(log, "relay pump client -> telegram",
+			func() { telegramConn.Close() }, //nolint: errcheck
+			func() { clientConn.Close() },   //nolint: errcheck
+		)
 
 		pump(log, telegramConn, clientConn, "client -> telegram")
 	}()

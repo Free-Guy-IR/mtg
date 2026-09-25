@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/mtglib/internal/recovery"
 )
 
 const (
@@ -16,6 +17,8 @@ const (
 	DoppelGangerScoutRepeats  = 10
 
 	MinCertSizesToCalculate = 3
+
+	gangerRestartDelay = time.Second
 )
 
 // NoiseParams holds the measured cert chain size for FakeTLS noise calibration.
@@ -62,9 +65,27 @@ func (g *Ganger) Shutdown() {
 }
 
 func (g *Ganger) Run() {
-	g.wg.Go(func() {
-		g.run()
+	g.wg.Go(g.supervise)
+}
+
+func (g *Ganger) supervise() {
+	for g.runRecovered() {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-time.After(gangerRestartDelay):
+		}
+	}
+}
+
+func (g *Ganger) runRecovered() (panicked bool) {
+	defer recovery.Guard(g.logger, "doppelganger run loop", func() {
+		panicked = true
 	})
+
+	g.run()
+
+	return false
 }
 
 // NoiseParams returns the current cert-size-based noise parameters.
@@ -116,6 +137,8 @@ func (g *Ganger) run() {
 	updatedStatsChan := make(chan Stats)
 
 	g.wg.Go(func() {
+		defer recovery.Guard(g.logger, "doppelganger scout raid")
+
 		g.runScoutRaid(scoutCollectedChan)
 	})
 
@@ -148,6 +171,8 @@ func (g *Ganger) run() {
 			durations := g.durations
 			currentScoutCollectedChan = nil
 			g.wg.Go(func() {
+				defer recovery.Guard(g.logger, "doppelganger stats")
+
 				select {
 				case <-g.ctx.Done():
 				case updatedStatsChan <- NewStats(durations, g.drs):
@@ -158,12 +183,14 @@ func (g *Ganger) run() {
 			currentScoutCollectedChan = scoutCollectedChan
 		case <-scoutTicker.C:
 			g.wg.Go(func() {
+				defer recovery.Guard(g.logger, "doppelganger scout raid")
+
 				g.runScoutRaid(scoutCollectedChan)
 			})
 		case req := <-g.connRequests:
 			select {
 			case <-g.ctx.Done():
-			case req.ret <- NewConn(g.ctx, req.payload, g.stats):
+			case req.ret <- NewConn(g.ctx, g.logger, req.payload, g.stats):
 			}
 		}
 	}
