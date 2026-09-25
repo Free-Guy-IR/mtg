@@ -1,0 +1,264 @@
+package doppel
+
+import (
+	"context"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const panicTestDeadline = 5 * time.Second
+
+type panicTestLogger struct {
+	mu        sync.Mutex
+	warnings  []string
+	onWarning func()
+}
+
+func (l *panicTestLogger) Info(string) {}
+
+func (l *panicTestLogger) WarningError(msg string, err error) {
+	l.mu.Lock()
+	l.warnings = append(l.warnings, msg+": "+err.Error())
+	onWarning := l.onWarning
+	l.mu.Unlock()
+
+	if onWarning != nil {
+		onWarning()
+	}
+}
+
+func (l *panicTestLogger) logged(value string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	count := 0
+
+	for _, warning := range l.warnings {
+		if strings.Contains(warning, value) && strings.Contains(warning, "goroutine ") {
+			count++
+		}
+	}
+
+	return count
+}
+
+func (l *panicTestLogger) waitForPanic(t *testing.T, value string, times int) {
+	t.Helper()
+
+	deadline := time.Now().Add(panicTestDeadline)
+
+	for l.logged(value) < times {
+		if time.Now().After(deadline) {
+			t.Fatalf("the panic %q with its stack was not logged %d times within %s", value, times, panicTestDeadline)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type panicTestNetwork struct {
+	SimpleNetwork
+}
+
+func (panicTestNetwork) NativeDialer() *net.Dialer {
+	panic("injected scout panic")
+}
+
+type panicTestConn struct {
+	closed       chan struct{}
+	closeOnce    sync.Once
+	panicOnWrite atomic.Bool
+}
+
+func newPanicTestConn() *panicTestConn {
+	return &panicTestConn{closed: make(chan struct{})}
+}
+
+func (c *panicTestConn) Read([]byte) (int, error) {
+	<-c.closed
+
+	return 0, net.ErrClosed
+}
+
+func (c *panicTestConn) Write(p []byte) (int, error) {
+	if c.panicOnWrite.Load() {
+		panic("injected doppel conn write panic")
+	}
+
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(p), nil
+	}
+}
+
+func (c *panicTestConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
+
+	return nil
+}
+
+func (c *panicTestConn) CloseRead() error                 { return nil }
+func (c *panicTestConn) CloseWrite() error                { return nil }
+func (c *panicTestConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *panicTestConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *panicTestConn) SetDeadline(time.Time) error      { return nil }
+func (c *panicTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *panicTestConn) SetWriteDeadline(time.Time) error { return nil }
+
+func panicTestWithin(t *testing.T, what string, fn func()) {
+	t.Helper()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		fn()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(panicTestDeadline):
+		t.Fatalf("%s did not return within %s", what, panicTestDeadline)
+	}
+}
+
+func panicTestNewConn(t *testing.T, g *Ganger, conn *panicTestConn) Conn {
+	t.Helper()
+
+	var (
+		rv  Conn
+		err error
+	)
+
+	panicTestWithin(t, "Ganger.NewConn", func() {
+		rv, err = g.NewConn(conn)
+	})
+
+	if err != nil {
+		t.Fatalf("Ganger.NewConn failed: %v", err)
+	}
+
+	return rv
+}
+
+func panicTestWritesFail(t *testing.T, conn Conn) {
+	t.Helper()
+
+	deadline := time.Now().Add(panicTestDeadline)
+
+	for {
+		var err error
+
+		panicTestWithin(t, "Conn.Write", func() {
+			_, err = conn.Write([]byte{1, 2, 3})
+		})
+
+		if err != nil {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("writes kept succeeding after the doppelganger writer panicked")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestGangerSurvivesAPanicInAScoutRaid(t *testing.T) {
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), panicTestNetwork{}, logger, time.Hour, 1, []string{"https://127.0.0.1:9"}, false)
+	g.Run()
+
+	logger.waitForPanic(t, "injected scout panic", 1)
+
+	conn := panicTestNewConn(t, g, newPanicTestConn())
+
+	panicTestWithin(t, "Conn.Stop", conn.Stop)
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+}
+
+func TestGangerSurvivesAPanicInItsRunLoopAndStillShutsDown(t *testing.T) {
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, -time.Second, 1, nil, false)
+	g.Run()
+
+	logger.waitForPanic(t, "non-positive interval", 1)
+
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+}
+
+func TestGangerRestartsItsRunLoopAfterAPanic(t *testing.T) {
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, -time.Second, 1, nil, false)
+	logger.onWarning = func() {
+		g.scoutRaidEach = time.Hour
+	}
+	g.Run()
+
+	logger.waitForPanic(t, "non-positive interval", 1)
+
+	conn := panicTestNewConn(t, g, newPanicTestConn())
+
+	panicTestWithin(t, "Conn.Stop", conn.Stop)
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+}
+
+func TestDoppelWriterPanicWhileHoldingTheBufferLockDoesNotHangWritersOrShutdown(t *testing.T) {
+	previous := beforeWrittenRead
+	fired := atomic.Bool{}
+	beforeWrittenRead = func() {
+		if fired.CompareAndSwap(false, true) {
+			panic("injected doppel writer panic")
+		}
+	}
+
+	t.Cleanup(func() {
+		beforeWrittenRead = previous
+	})
+
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, time.Hour, 1, nil, false)
+	g.Run()
+
+	conn := panicTestNewConn(t, g, newPanicTestConn())
+
+	panicTestWithin(t, "Conn.Write", func() {
+		conn.Write([]byte{1, 2, 3}) //nolint: errcheck
+	})
+
+	logger.waitForPanic(t, "injected doppel writer panic", 1)
+	panicTestWritesFail(t, conn)
+
+	panicTestWithin(t, "Conn.Stop", conn.Stop)
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+}
+
+func TestDoppelWriterPanicInTheUnderlyingWriteDoesNotHangWritersOrShutdown(t *testing.T) {
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, time.Hour, 1, nil, false)
+	g.Run()
+
+	underlying := newPanicTestConn()
+	underlying.panicOnWrite.Store(true)
+	conn := panicTestNewConn(t, g, underlying)
+
+	panicTestWithin(t, "Conn.Write", func() {
+		conn.Write([]byte{1, 2, 3}) //nolint: errcheck
+	})
+
+	logger.waitForPanic(t, "injected doppel conn write panic", 1)
+	panicTestWritesFail(t, conn)
+
+	panicTestWithin(t, "Conn.Stop", conn.Stop)
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+}

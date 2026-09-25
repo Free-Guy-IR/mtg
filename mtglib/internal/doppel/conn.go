@@ -17,6 +17,8 @@ var doppelBufPool = sync.Pool{
 	},
 }
 
+var beforeWrittenRead = func() {}
+
 type Conn struct {
 	essentials.Conn
 
@@ -69,6 +71,7 @@ func (c Conn) start() {
 		for c.p.writeStream.Len() == 0 && !c.p.done {
 			c.p.writtenCond.Wait()
 		}
+		beforeWrittenRead()
 		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
 		c.p.writtenCond.L.Unlock()
 
