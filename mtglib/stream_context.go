@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/9seconds/mtg/v2/essentials"
@@ -13,7 +14,9 @@ import (
 type streamContext struct {
 	ctx          context.Context
 	ctxCancel    context.CancelFunc
+	acceptedConn essentials.Conn
 	clientConn   essentials.Conn
+	telegramMu   sync.Mutex
 	telegramConn essentials.Conn
 	streamID     string
 	dc           int
@@ -45,17 +48,29 @@ func (s *streamContext) Value(key any) any {
 func (s *streamContext) Close() {
 	s.ctxCancel()
 
-	if s.clientConn != nil {
-		s.clientConn.Close() //nolint: errcheck
-	}
+	s.acceptedConn.Close() //nolint: errcheck
 
-	if s.telegramConn != nil {
-		s.telegramConn.Close() //nolint: errcheck
+	if telegramConn := s.telegramConnection(); telegramConn != nil {
+		telegramConn.Close() //nolint: errcheck
 	}
 }
 
+func (s *streamContext) setTelegramConn(conn essentials.Conn) {
+	s.telegramMu.Lock()
+	defer s.telegramMu.Unlock()
+
+	s.telegramConn = conn
+}
+
+func (s *streamContext) telegramConnection() essentials.Conn {
+	s.telegramMu.Lock()
+	defer s.telegramMu.Unlock()
+
+	return s.telegramConn
+}
+
 func (s *streamContext) ClientIP() net.IP {
-	return s.clientConn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+	return s.acceptedConn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
 }
 
 func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.Conn) *streamContext {
@@ -67,10 +82,11 @@ func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.
 
 	ctx, cancel := context.WithCancel(ctx)
 	streamCtx := &streamContext{
-		ctx:        ctx,
-		ctxCancel:  cancel,
-		clientConn: clientConn,
-		streamID:   base64.RawURLEncoding.EncodeToString(connIDBytes),
+		ctx:          ctx,
+		ctxCancel:    cancel,
+		acceptedConn: clientConn,
+		clientConn:   clientConn,
+		streamID:     base64.RawURLEncoding.EncodeToString(connIDBytes),
 	}
 	streamCtx.logger = logger.
 		BindStr("stream-id", streamCtx.streamID).

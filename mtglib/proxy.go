@@ -235,7 +235,7 @@ func (p *Proxy) serveConn(conn essentials.Conn) {
 	relay.Relay(
 		ctx,
 		ctx.logger.Named("relay"),
-		connIdleTimeout{Conn: ctx.telegramConn, tracker: tracker},
+		connIdleTimeout{Conn: ctx.telegramConnection(), tracker: tracker},
 		connIdleTimeout{Conn: ctx.clientConn, tracker: tracker},
 	)
 }
@@ -502,12 +502,12 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 		return fmt.Errorf("cannot perform server handshake: %w", err)
 	}
 
-	ctx.telegramConn = connTraffic{
+	ctx.setTelegramConn(connTraffic{
 		Conn:     tgConn,
 		streamID: ctx.streamID,
 		stream:   p.eventStream,
 		ctx:      ctx,
-	}
+	})
 
 	telegramHost, _, err := net.SplitHostPort(foundAddr.Address)
 	if err != nil {

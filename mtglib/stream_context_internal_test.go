@@ -76,7 +76,7 @@ func (suite *StreamContextTestSuite) TestClose() {
 	tgConnMock := &testlib.EssentialsConnMock{}
 	tgConnMock.On("Close").Once().Return(nil)
 
-	suite.ctx.telegramConn = tgConnMock
+	suite.ctx.setTelegramConn(tgConnMock)
 	suite.ctx.Close()
 
 	select {
