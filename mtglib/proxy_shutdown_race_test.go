@@ -2,8 +2,12 @@ package mtglib_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -11,9 +15,12 @@ import (
 	"time"
 
 	"github.com/9seconds/mtg/v2/antireplay"
+	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/events"
 	"github.com/9seconds/mtg/v2/ipblocklist"
 	"github.com/9seconds/mtg/v2/logger"
 	"github.com/9seconds/mtg/v2/mtglib"
+	"github.com/9seconds/mtg/v2/mtglib/obfuscation"
 	"github.com/9seconds/mtg/v2/network"
 )
 
@@ -561,4 +568,282 @@ func TestServeOnAShutDownProxyReturnsWithoutAccepting(t *testing.T) {
 	if started, _ := ledger.closeBooks(); started != 0 {
 		t.Fatalf("a shut-down proxy started %d streams", started)
 	}
+}
+
+const streamCloseFakeTLSSecret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+
+var errStreamCloseDialRefused = errors.New("telegram dial refused")
+
+type streamCloseRefusingNetwork struct {
+	mtglib.Network
+
+	delay time.Duration
+}
+
+func (n streamCloseRefusingNetwork) Dial(string, string) (essentials.Conn, error) {
+	time.Sleep(n.delay)
+
+	return nil, errStreamCloseDialRefused
+}
+
+type streamCloseSinkNetwork struct {
+	mtglib.Network
+
+	addr string
+}
+
+func (n streamCloseSinkNetwork) Dial(string, string) (essentials.Conn, error) {
+	conn, err := net.DialTimeout("tcp", n.addr, 5*time.Second)
+	if err != nil {
+		return nil, err //nolint: wrapcheck
+	}
+
+	shutdownRaceResetOnClose(conn)
+
+	return conn.(*net.TCPConn), nil //nolint: forcetypeassert
+}
+
+type streamCloseSink struct {
+	listener net.Listener
+
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func newStreamCloseSink(t *testing.T) *streamCloseSink {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("cannot listen: %v", err)
+	}
+
+	sink := &streamCloseSink{listener: listener}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			shutdownRaceResetOnClose(conn)
+
+			sink.mu.Lock()
+			sink.conns = append(sink.conns, conn)
+			sink.mu.Unlock()
+		}
+	}()
+
+	t.Cleanup(func() {
+		listener.Close() //nolint: errcheck
+
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+
+		shutdownRaceCloseAll(sink.conns)
+	})
+
+	return sink
+}
+
+func streamCloseNetwork(t *testing.T) mtglib.Network {
+	t.Helper()
+
+	return newShutdownRaceRun(t).ntw
+}
+
+type streamCloseSlowDCReport struct {
+	delay time.Duration
+}
+
+func (s streamCloseSlowDCReport) Send(_ context.Context, evt mtglib.Event) {
+	if _, ok := evt.(mtglib.EventConnectedToDC); ok {
+		time.Sleep(s.delay)
+	}
+}
+
+func streamCloseProxy(t *testing.T, secret mtglib.Secret, plain bool, ntw mtglib.Network) *mtglib.Proxy {
+	t.Helper()
+
+	return streamCloseProxyReporting(t, secret, plain, ntw, events.NewNoopStream())
+}
+
+func streamCloseProxyReporting(
+	t *testing.T,
+	secret mtglib.Secret,
+	plain bool,
+	ntw mtglib.Network,
+	stream mtglib.EventStream,
+) *mtglib.Proxy {
+	t.Helper()
+
+	proxy, err := mtglib.NewProxy(mtglib.ProxyOpts{
+		Secret:               secret,
+		PlainMode:            plain,
+		Network:              ntw,
+		AntiReplayCache:      antireplay.NewNoop(),
+		IPBlocklist:          ipblocklist.NewNoop(),
+		IPAllowlist:          shutdownRaceAllowAll{},
+		EventStream:          stream,
+		Logger:               logger.NewNoopLogger(),
+		HandshakeTimeout:     time.Minute,
+		TolerateTimeSkewness: 100 * 365 * 24 * time.Hour,
+		UseTestDCs:           true,
+	})
+	if err != nil {
+		t.Fatalf("cannot build proxy: %v", err)
+	}
+
+	return proxy
+}
+
+func streamCloseServeOne(t *testing.T, proxy *mtglib.Proxy) (*net.TCPConn, chan struct{}) {
+	t.Helper()
+
+	servers, clients := shutdownRaceAcceptedPairs(t, 1)
+	if len(servers) != 1 {
+		t.Fatalf("cannot connect a client")
+	}
+
+	served := make(chan struct{})
+
+	go func() {
+		defer close(served)
+
+		proxy.ServeConn(servers[0])
+	}()
+
+	t.Cleanup(func() {
+		shutdownRaceCloseAll(clients)
+	})
+
+	return clients[0].(*net.TCPConn), served //nolint: forcetypeassert
+}
+
+func streamCloseShutdownWithin(t *testing.T, proxy *mtglib.Proxy, served chan struct{}, deadline time.Duration) {
+	t.Helper()
+
+	started := time.Now()
+
+	if value := shutdownRaceShutdown(t, proxy); value != nil {
+		t.Fatalf("Shutdown panicked: %v", value)
+	}
+
+	select {
+	case <-served:
+	case <-time.After(shutdownRaceDeadline):
+		t.Fatalf("ServeConn did not return after Shutdown")
+	}
+
+	if took := time.Since(started); took > deadline {
+		t.Fatalf("Shutdown took %s, want the cancelled stream closed within %s", took, deadline)
+	}
+}
+
+func streamCloseRecordedHello(t *testing.T) []byte {
+	t.Helper()
+
+	raw, err := os.ReadFile("internal/tls/fake/testdata/client-hello-ok-19dfe38384b9884b.json")
+	if err != nil {
+		t.Fatalf("cannot read recorded hello: %v", err)
+	}
+
+	recorded := struct {
+		Full string `json:"full"`
+	}{}
+	if err := json.Unmarshal(raw, &recorded); err != nil {
+		t.Fatalf("cannot parse recorded hello: %v", err)
+	}
+
+	hello, err := base64.StdEncoding.DecodeString(recorded.Full)
+	if err != nil {
+		t.Fatalf("cannot decode recorded hello: %v", err)
+	}
+
+	return hello
+}
+
+func streamCloseSendPlainHandshake(t *testing.T, client *net.TCPConn, secret mtglib.Secret) {
+	t.Helper()
+
+	if _, err := (obfuscation.Obfuscator{Secret: secret.Key[:]}).SendHandshake(client, 2); err != nil {
+		t.Fatalf("cannot send client handshake: %v", err)
+	}
+}
+
+func streamCloseAwaitClosed(t *testing.T, client *net.TCPConn) {
+	t.Helper()
+
+	client.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint: errcheck
+
+	buf := make([]byte, 1024)
+
+	for {
+		_, err := client.Read(buf)
+		if err == nil {
+			continue
+		}
+
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatalf("the client connection was still open after Shutdown")
+		}
+
+		return
+	}
+}
+
+func TestShutdownDuringAPlainHandshakeDoesNotRaceTheStreamClose(t *testing.T) {
+	secret := mtglib.GenerateSecret("example.com")
+	proxy := streamCloseProxy(t, secret, true,
+		streamCloseRefusingNetwork{Network: streamCloseNetwork(t), delay: 400 * time.Millisecond})
+	client, served := streamCloseServeOne(t, proxy)
+
+	streamCloseSendPlainHandshake(t, client, secret)
+	time.Sleep(150 * time.Millisecond)
+
+	streamCloseShutdownWithin(t, proxy, served, shutdownRaceDeadline)
+	streamCloseAwaitClosed(t, client)
+}
+
+func TestShutdownDuringAFakeTLSHandshakeDoesNotRaceTheStreamClose(t *testing.T) {
+	secret, err := mtglib.ParseSecret(streamCloseFakeTLSSecret)
+	if err != nil {
+		t.Fatalf("cannot parse secret: %v", err)
+	}
+
+	proxy := streamCloseProxy(t, secret, false, streamCloseNetwork(t))
+	client, served := streamCloseServeOne(t, proxy)
+
+	if _, err := client.Write(streamCloseRecordedHello(t)); err != nil {
+		t.Fatalf("cannot send client hello: %v", err)
+	}
+
+	client.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint: errcheck
+
+	reply := make([]byte, 5)
+	if _, err := client.Read(reply); err != nil || reply[0] != 0x16 {
+		t.Fatalf("the proxy did not answer the recorded hello with a server hello: %v %x", err, reply)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	streamCloseShutdownWithin(t, proxy, served, 5*time.Second)
+	streamCloseAwaitClosed(t, client)
+}
+
+func TestShutdownRightAfterTheTelegramDialDoesNotRaceTheStreamClose(t *testing.T) {
+	sink := newStreamCloseSink(t)
+	secret := mtglib.GenerateSecret("example.com")
+	proxy := streamCloseProxyReporting(t, secret, true,
+		streamCloseSinkNetwork{Network: streamCloseNetwork(t), addr: sink.listener.Addr().String()},
+		streamCloseSlowDCReport{delay: 400 * time.Millisecond})
+	client, served := streamCloseServeOne(t, proxy)
+
+	streamCloseSendPlainHandshake(t, client, secret)
+	time.Sleep(150 * time.Millisecond)
+
+	streamCloseShutdownWithin(t, proxy, served, 5*time.Second)
+	streamCloseAwaitClosed(t, client)
 }
