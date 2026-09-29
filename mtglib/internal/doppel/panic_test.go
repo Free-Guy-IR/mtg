@@ -3,6 +3,8 @@ package doppel
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -312,6 +314,72 @@ func TestGangerCapsItsRestartBackoffAndResetsItAfterALongRun(t *testing.T) {
 
 	if afterLongRun := gaps[5] - longRun; afterLongRun >= ceiling {
 		t.Fatalf("a run that lasted %s did not reset the restart delay: waited %s, gaps %v", longRun, afterLongRun, gaps)
+	}
+}
+
+func panicTestChattyTLSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher, _ := w.(http.Flusher)
+
+		for range 2 * MinDurationsToCalculate {
+			if _, err := w.Write([]byte{1}); err != nil {
+				return
+			}
+
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func TestGangerKeepsLearningAfterAPanicWhileComputingStats(t *testing.T) {
+	server := panicTestChattyTLSServer(t)
+	logger := &panicTestLogger{}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, 20*time.Millisecond, 1, []string{server.URL}, false)
+	defaults := g.stats
+
+	computed := make(chan struct{}, 1)
+	release := make(chan struct{})
+	calls := atomic.Int32{}
+
+	g.newStats = func(durations []time.Duration, drs bool) Stats {
+		switch calls.Add(1) {
+		case 1:
+			panic("injected doppel stats panic")
+		case 2:
+			computed <- struct{}{}
+			<-release
+		}
+
+		return NewStats(durations, drs)
+	}
+
+	g.Run()
+
+	defer func() {
+		panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+	}()
+	defer close(release)
+
+	logger.waitForPanic(t, "injected doppel stats panic", 1)
+
+	select {
+	case <-computed:
+	case <-time.After(panicTestDeadline):
+		t.Fatalf("the ganger stopped collecting scout results after a panic while computing stats")
+	}
+
+	conn := panicTestNewConn(t, g, newPanicTestConn())
+	defer panicTestWithin(t, "Conn.Stop", conn.Stop)
+
+	if conn.p.stats != defaults {
+		t.Fatalf("a panic while computing stats replaced the stats %+v with %+v", defaults, conn.p.stats)
 	}
 }
 
