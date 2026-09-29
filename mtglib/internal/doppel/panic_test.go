@@ -225,6 +225,13 @@ func (r *panicTestRestarts) record() {
 	r.times = append(r.times, time.Now())
 }
 
+func (r *panicTestRestarts) recorded() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.times)
+}
+
 func (r *panicTestRestarts) waitFor(t *testing.T, count int, deadline time.Duration) []time.Duration {
 	t.Helper()
 
@@ -264,6 +271,47 @@ func TestGangerBacksOffRestartingARunLoopThatKeepsPanicking(t *testing.T) {
 
 	if gaps[0] < gangerRestartDelay || gaps[1] < 2*gangerRestartDelay {
 		t.Fatalf("a run loop that keeps panicking was restarted after %v, want a delay that doubles from %s", gaps, gangerRestartDelay)
+	}
+}
+
+func TestGangerCapsItsRestartBackoffAndResetsItAfterALongRun(t *testing.T) {
+	const (
+		base    = 25 * time.Millisecond
+		ceiling = 200 * time.Millisecond
+		longRun = 250 * time.Millisecond
+	)
+
+	restarts := &panicTestRestarts{}
+	logger := &panicTestLogger{}
+	logger.onWarning = func() {
+		restarts.record()
+
+		if restarts.recorded() == 6 {
+			time.Sleep(longRun)
+		}
+	}
+
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, -time.Second, 1, nil, false)
+	g.restartDelay = base
+	g.restartMaxDelay = ceiling
+	g.Run()
+
+	gaps := restarts.waitFor(t, 7, panicTestDeadline)
+
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+
+	for i, want := range []time.Duration{base, 2 * base, 4 * base, ceiling, ceiling} {
+		if gaps[i] < want {
+			t.Fatalf("restart %d came after %s, want at least %s, gaps %v", i+1, gaps[i], want, gaps)
+		}
+	}
+
+	if gaps[4] >= 2*ceiling {
+		t.Fatalf("the restart delay grew past its ceiling %s: gaps %v", ceiling, gaps)
+	}
+
+	if afterLongRun := gaps[5] - longRun; afterLongRun >= ceiling {
+		t.Fatalf("a run that lasted %s did not reset the restart delay: waited %s, gaps %v", longRun, afterLongRun, gaps)
 	}
 }
 

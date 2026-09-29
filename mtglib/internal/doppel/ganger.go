@@ -18,7 +18,8 @@ const (
 
 	MinCertSizesToCalculate = 3
 
-	gangerRestartDelay = time.Second
+	gangerRestartDelay    = time.Second
+	gangerRestartMaxDelay = 30 * time.Second
 )
 
 // NoiseParams holds the measured cert chain size for FakeTLS noise calibration.
@@ -57,6 +58,9 @@ type Ganger struct {
 	noiseParams atomic.Pointer[NoiseParams]
 
 	connRequests chan gangerConnRequest
+
+	restartDelay    time.Duration
+	restartMaxDelay time.Duration
 }
 
 func (g *Ganger) Shutdown() {
@@ -69,12 +73,26 @@ func (g *Ganger) Run() {
 }
 
 func (g *Ganger) supervise() {
-	for g.runRecovered() {
+	delay := g.restartDelay
+
+	for {
+		started := time.Now()
+
+		if !g.runRecovered() {
+			return
+		}
+
+		if time.Since(started) >= g.restartMaxDelay {
+			delay = g.restartDelay
+		}
+
 		select {
 		case <-g.ctx.Done():
 			return
-		case <-time.After(gangerRestartDelay):
+		case <-time.After(delay):
 		}
+
+		delay = min(2*delay, g.restartMaxDelay)
 	}
 }
 
@@ -290,7 +308,9 @@ func NewGanger(
 			lambda: StatsDefaultLambda,
 			drs:    drs,
 		},
-		scout:        NewScout(network, urls),
-		connRequests: make(chan gangerConnRequest),
+		scout:           NewScout(network, urls),
+		connRequests:    make(chan gangerConnRequest),
+		restartDelay:    gangerRestartDelay,
+		restartMaxDelay: gangerRestartMaxDelay,
 	}
 }
