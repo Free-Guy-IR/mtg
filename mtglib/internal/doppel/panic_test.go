@@ -213,6 +213,60 @@ func TestGangerRestartsItsRunLoopAfterAPanic(t *testing.T) {
 	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
 }
 
+type panicTestRestarts struct {
+	mu    sync.Mutex
+	times []time.Time
+}
+
+func (r *panicTestRestarts) record() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.times = append(r.times, time.Now())
+}
+
+func (r *panicTestRestarts) waitFor(t *testing.T, count int, deadline time.Duration) []time.Duration {
+	t.Helper()
+
+	until := time.Now().Add(deadline)
+
+	for {
+		r.mu.Lock()
+		times := append([]time.Time(nil), r.times...)
+		r.mu.Unlock()
+
+		if len(times) >= count {
+			gaps := make([]time.Duration, 0, count-1)
+			for i := 1; i < count; i++ {
+				gaps = append(gaps, times[i].Sub(times[i-1]))
+			}
+
+			return gaps
+		}
+
+		if time.Now().After(until) {
+			t.Fatalf("the run loop panicked %d times within %s, want %d", len(times), deadline, count)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestGangerBacksOffRestartingARunLoopThatKeepsPanicking(t *testing.T) {
+	restarts := &panicTestRestarts{}
+	logger := &panicTestLogger{onWarning: restarts.record}
+	g := NewGanger(context.Background(), SimpleNetwork{}, logger, -time.Second, 1, nil, false)
+	g.Run()
+
+	gaps := restarts.waitFor(t, 3, 5*gangerRestartDelay)
+
+	panicTestWithin(t, "Ganger.Shutdown", g.Shutdown)
+
+	if gaps[0] < gangerRestartDelay || gaps[1] < 2*gangerRestartDelay {
+		t.Fatalf("a run loop that keeps panicking was restarted after %v, want a delay that doubles from %s", gaps, gangerRestartDelay)
+	}
+}
+
 func TestDoppelWriterPanicWhileHoldingTheBufferLockDoesNotHangWritersOrShutdown(t *testing.T) {
 	previous := beforeWrittenRead
 	fired := atomic.Bool{}
