@@ -29,6 +29,7 @@ type shutdownRaceListener struct {
 	net.Listener
 
 	remaining atomic.Int64
+	accepted  atomic.Int64
 }
 
 func (l *shutdownRaceListener) Accept() (net.Conn, error) {
@@ -42,6 +43,7 @@ func (l *shutdownRaceListener) Accept() (net.Conn, error) {
 	}
 
 	shutdownRaceResetOnClose(conn)
+	l.accepted.Add(1)
 
 	return conn, nil
 }
@@ -377,6 +379,84 @@ func TestShutdownRightAfterServeReturnsWaitsForEveryHandedOffConnection(t *testi
 			}
 
 			run.verdict(t)
+		})
+	}
+}
+
+func TestShutdownRightAfterServeReturnsServesEveryConnectionServeAccepted(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		processors int
+	}{
+		{name: "one processor", processors: 1},
+		{name: "every processor"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if testCase.processors > 0 {
+				previous := runtime.GOMAXPROCS(testCase.processors)
+				defer runtime.GOMAXPROCS(previous)
+			}
+
+			const (
+				rounds  = 200
+				clients = 64
+			)
+
+			run := newShutdownRaceRun(t)
+			refusedRounds := 0
+			firstRefusal := ""
+
+			for round := range rounds {
+				proxy, ledger := run.newProxy(t, 0)
+
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("cannot listen: %v", err)
+				}
+
+				conns := shutdownRaceDial(listener.Addr().String(), clients)
+				counted := &shutdownRaceListener{Listener: listener}
+				counted.remaining.Store(int64(shutdownRaceConnected(conns)))
+
+				shutdownPanic := make(chan any, 1)
+
+				go func() {
+					defer func() {
+						shutdownPanic <- recover()
+					}()
+
+					proxy.Serve(counted) //nolint: errcheck
+					proxy.Shutdown()
+				}()
+
+				select {
+				case value := <-shutdownPanic:
+					run.closeRound(ledger, value)
+				case <-time.After(shutdownRaceDeadline):
+					t.Fatalf("round %d: Serve and Shutdown did not return", round)
+				}
+
+				accepted := int(counted.accepted.Load())
+
+				if started, finished := ledger.closeBooks(); started != accepted || finished != accepted {
+					refusedRounds++
+
+					if firstRefusal == "" {
+						firstRefusal = fmt.Sprintf("round %d: Serve accepted %d, %d started and %d finished before Shutdown returned",
+							round, accepted, started, finished)
+					}
+				}
+
+				listener.Close() //nolint: errcheck
+				shutdownRaceCloseAll(conns)
+			}
+
+			run.verdict(t)
+
+			if refusedRounds > 0 {
+				t.Errorf("Shutdown did not serve and await every connection Serve had accepted before it in %d of %d rounds, first: %s",
+					refusedRounds, rounds, firstRefusal)
+			}
 		})
 	}
 }
