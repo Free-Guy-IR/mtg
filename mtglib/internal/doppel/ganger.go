@@ -61,6 +61,8 @@ type Ganger struct {
 
 	restartDelay    time.Duration
 	restartMaxDelay time.Duration
+
+	newStats func(durations []time.Duration, drs bool) Stats
 }
 
 func (g *Ganger) Shutdown() {
@@ -192,7 +194,7 @@ func (g *Ganger) run() {
 
 				select {
 				case <-g.ctx.Done():
-				case updatedStatsChan <- NewStats(durations, g.drs):
+				case updatedStatsChan <- g.newStats(durations, g.drs):
 				}
 			})
 		case stats := <-updatedStatsChan:
@@ -312,5 +314,6 @@ func NewGanger(
 		connRequests:    make(chan gangerConnRequest),
 		restartDelay:    gangerRestartDelay,
 		restartMaxDelay: gangerRestartMaxDelay,
+		newStats:        NewStats,
 	}
 }
