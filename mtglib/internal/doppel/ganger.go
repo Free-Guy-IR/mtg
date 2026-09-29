@@ -188,14 +188,20 @@ func (g *Ganger) run() {
 			}
 
 			durations := g.durations
+			previous := g.stats
 			currentScoutCollectedChan = nil
 			g.wg.Go(func() {
+				stats := previous
+
+				defer func() {
+					select {
+					case <-g.ctx.Done():
+					case updatedStatsChan <- stats:
+					}
+				}()
 				defer recovery.Guard(g.logger, "doppelganger stats")
 
-				select {
-				case <-g.ctx.Done():
-				case updatedStatsChan <- g.newStats(durations, g.drs):
-				}
+				stats = g.newStats(durations, g.drs)
 			})
 		case stats := <-updatedStatsChan:
 			g.stats = stats
