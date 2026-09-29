@@ -376,10 +376,11 @@ func TestGangerKeepsLearningAfterAPanicWhileComputingStats(t *testing.T) {
 	}
 
 	conn := panicTestNewConn(t, g, newPanicTestConn())
-	defer panicTestWithin(t, "Conn.Stop", conn.Stop)
+	panicTestWithin(t, "Conn.Stop", conn.Stop)
 
-	if conn.p.stats != defaults {
-		t.Fatalf("a panic while computing stats replaced the stats %+v with %+v", defaults, conn.p.stats)
+	got := conn.p.stats
+	if got.k != defaults.k || got.lambda != defaults.lambda || got.drs != defaults.drs {
+		t.Fatalf("a panic while computing stats replaced the stats %+v with %+v", defaults, got)
 	}
 }
 
