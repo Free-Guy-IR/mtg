@@ -187,9 +187,12 @@ func (g *Ganger) run() {
 				g.runScoutRaid(scoutCollectedChan)
 			})
 		case req := <-g.connRequests:
+			conn := NewConn(g.ctx, g.logger, req.payload, g.stats)
+
 			select {
 			case <-g.ctx.Done():
-			case req.ret <- NewConn(g.ctx, g.logger, req.payload, g.stats):
+				conn.Stop()
+			case req.ret <- conn:
 			}
 		}
 	}
