@@ -1,6 +1,8 @@
 module github.com/9seconds/mtg/v2
 
-go 1.26
+go 1.26.0
+
+toolchain go1.26.10
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8
@@ -20,9 +22,9 @@ require (
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1
 	github.com/tylertreat/BoomFilters v0.0.0-20251117164519-53813c36cc1b
-	golang.org/x/crypto v0.49.0
-	golang.org/x/net v0.52.0
-	golang.org/x/sys v0.42.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
