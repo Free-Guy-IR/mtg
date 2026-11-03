@@ -75,7 +75,7 @@ type connProxyProtocol struct {
 
 func (c *connProxyProtocol) Write(p []byte) (int, error) {
 	if !c.headersWritten {
-		headers := proxyproto.HeaderProxyFromAddrs(2, c.sourceAddr, c.RemoteAddr())
+		headers := proxyProtocolHeader(c.sourceAddr, c.RemoteAddr())
 
 		toSend, err := headers.Format()
 		if err != nil {
@@ -90,6 +90,17 @@ func (c *connProxyProtocol) Write(p []byte) (int, error) {
 	}
 
 	return c.Conn.Write(p)
+}
+
+func proxyProtocolHeader(source, target net.Addr) *proxyproto.Header {
+	header := proxyproto.HeaderProxyFromAddrs(2, source, target)
+
+	targetTCP, ok := target.(*net.TCPAddr)
+	if ok && header.TransportProtocol == proxyproto.TCPv4 && targetTCP.IP.To4() == nil {
+		header.TransportProtocol = proxyproto.TCPv6
+	}
+
+	return header
 }
 
 func newConnProxyProtocol(source, target essentials.Conn) *connProxyProtocol {
