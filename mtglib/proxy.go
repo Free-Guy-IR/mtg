@@ -37,6 +37,7 @@ type Proxy struct {
 	domainFrontingHost          string
 	domainFrontingProxyProtocol bool
 	workerPool                  *ants.PoolWithFunc
+	admissions                  chan struct{}
 	plainMode                   bool
 	fakeTLSDomains              []string
 	authFailures                *authFailureLimiter
@@ -269,27 +270,26 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			return nil
 		}
 
-		err = p.workerPool.Invoke(conn)
-		if err == nil {
+		select {
+		case p.admissions <- struct{}{}:
+		default:
+			conn.Close() //nolint: errcheck
+			p.streamWaitGroup.Done()
+			p.logger.Info("connection was concurrency limited")
+			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
+
 			continue
 		}
 
-		conn.Close() //nolint: errcheck
-		p.streamWaitGroup.Done()
+		go func() {
+			defer func() { <-p.admissions }()
 
-		switch {
-		case errors.Is(err, ants.ErrPoolClosed):
-			return nil
-		case errors.Is(err, ants.ErrPoolOverload):
-			p.logger.Info("connection was concurrency limited")
-			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
-		default:
-			p.logger.WarningError("cannot hand the connection to a worker", err)
-		}
+			p.admitConn(conn)
+		}()
 	}
 }
 
-func remoteAddrUntilDone(ctx context.Context, conn essentials.Conn) net.Addr {
+func remoteAddrUntilDone(ctx context.Context, conn net.Conn) net.Addr {
 	resolved := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		ticker := time.NewTicker(pendingReadInterruptInterval)
@@ -312,37 +312,54 @@ func remoteAddrUntilDone(ctx context.Context, conn essentials.Conn) net.Addr {
 	return conn.RemoteAddr()
 }
 
-func (p *Proxy) admitConn(conn essentials.Conn) bool {
+func (p *Proxy) admitConn(conn net.Conn) {
+	handedOver := false
+
+	defer func() {
+		if !handedOver {
+			conn.Close() //nolint: errcheck
+			p.streamWaitGroup.Done()
+		}
+	}()
+
 	remoteAddr := remoteAddrUntilDone(p.ctx, conn)
 
 	ipAddr := remoteTCPIP(remoteAddr)
 	if ipAddr == nil {
-		conn.Close() //nolint: errcheck
 		p.logger.BindStr("addr-type", fmt.Sprintf("%T", remoteAddr)).
 			Info("connection was rejected: remote address has no tcp ip")
 
-		return false
+		return
 	}
 
 	logger := p.logger.BindStr("ip", ipAddr.String())
 
 	if !p.allowlist.Contains(ipAddr) {
-		conn.Close() //nolint: errcheck
 		logger.Info("ip was rejected by allowlist")
 		p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
 
-		return false
+		return
 	}
 
 	if p.blocklist.Contains(ipAddr) {
-		conn.Close() //nolint: errcheck
 		logger.Info("ip was blacklisted")
 		p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
 
-		return false
+		return
 	}
 
-	return true
+	err := p.workerPool.Invoke(conn)
+
+	switch {
+	case err == nil:
+		handedOver = true
+	case errors.Is(err, ants.ErrPoolClosed):
+	case errors.Is(err, ants.ErrPoolOverload):
+		logger.Info("connection was concurrency limited")
+		p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
+	default:
+		logger.WarningError("cannot hand the connection to a worker", err)
+	}
 }
 
 // Shutdown 'gracefully' shutdowns all connections. Please remember that it
@@ -700,10 +717,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		func(arg any) {
 			defer proxy.streamWaitGroup.Done()
 
-			conn := arg.(essentials.Conn) //nolint: forcetypeassert
-			if proxy.admitConn(conn) {
-				proxy.serveConn(conn)
-			}
+			proxy.serveConn(arg.(essentials.Conn)) //nolint: forcetypeassert
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))
@@ -712,6 +726,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	}
 
 	proxy.workerPool = pool
+	proxy.admissions = make(chan struct{}, opts.getConcurrency())
 
 	return proxy, nil
 }

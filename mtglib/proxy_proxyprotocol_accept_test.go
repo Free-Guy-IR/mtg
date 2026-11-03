@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/9seconds/mtg/v2/antireplay"
 	"github.com/9seconds/mtg/v2/events"
 	"github.com/9seconds/mtg/v2/internal/proxyprotocol"
 	"github.com/9seconds/mtg/v2/internal/utils"
 	"github.com/9seconds/mtg/v2/logger"
 	"github.com/9seconds/mtg/v2/mtglib"
+	"github.com/9seconds/mtg/v2/network"
 	"github.com/pires/go-proxyproto"
 )
 
@@ -320,4 +322,84 @@ func TestShutdownRacingProxyHeadersLeavesNoStreamBehind(t *testing.T) {
 
 		assertNoPendingHeaderReaders(t)
 	}
+}
+
+type blockOne struct {
+	ip net.IP
+}
+
+func (b blockOne) Contains(ip net.IP) bool { return ip.Equal(b.ip) }
+func (blockOne) Run(time.Duration)         {}
+func (blockOne) Shutdown()                 {}
+
+func TestServeJudgesABlocklistedClientBeforeTheWorkerPool(t *testing.T) {
+	dialer, err := network.NewDefaultDialer(0, 0)
+	if err != nil {
+		t.Fatalf("cannot build dialer: %v", err)
+	}
+
+	ntw, err := network.NewNetwork(dialer, "mtgtest", "1.1.1.1", 0)
+	if err != nil {
+		t.Fatalf("cannot build network: %v", err)
+	}
+
+	blocked := net.IPv4(192, 0, 2, 66)
+	stream := &recordingEvents{}
+
+	proxy, err := mtglib.NewProxy(mtglib.ProxyOpts{
+		Secret:           mtglib.GenerateSecret("example.com"),
+		PlainMode:        true,
+		Network:          ntw,
+		AntiReplayCache:  antireplay.NewNoop(),
+		IPBlocklist:      blockOne{ip: blocked},
+		IPAllowlist:      &allowAll{},
+		EventStream:      stream,
+		Logger:           logger.NewNoopLogger(),
+		UseTestDCs:       true,
+		HandshakeTimeout: 3 * time.Second,
+		Concurrency:      1,
+	})
+	if err != nil {
+		t.Fatalf("cannot build proxy: %v", err)
+	}
+
+	listener := newSignallingProxyProtocolListener(t)
+	done := serveRecovering(proxy, listener)
+	dst := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+
+	busy := sendRaw(t, listener.Addr(), proxyHeaderBytes(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 65), Port: 5000}, dst))
+
+	deadline := time.Now().Add(pendingHeaderBudget)
+
+	for started, _ := countStreams(stream.snapshot()); started == 0; started, _ = countStreams(stream.snapshot()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the first client never took the only worker")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	blockedConn := sendRaw(t, listener.Addr(), proxyHeaderBytes(t, &net.TCPAddr{IP: blocked, Port: 5001}, dst))
+	assertClosedByProxy(t, blockedConn)
+
+	blocklisted, limited := 0, 0
+
+	for _, evt := range stream.snapshot() {
+		switch evt.(type) {
+		case mtglib.EventIPBlocklisted:
+			blocklisted++
+		case mtglib.EventConcurrencyLimited:
+			limited++
+		}
+	}
+
+	if blocklisted != 1 || limited != 0 {
+		t.Fatalf("a blocklisted client behind a full worker pool gave %d blocklisted and %d concurrency-limited events, want 1 and 0",
+			blocklisted, limited)
+	}
+
+	busy.Close()     //nolint: errcheck
+	listener.Close() //nolint: errcheck
+	shutdownWithin(t, proxy, 2*pendingHeaderBudget)
+	assertServeEndedCleanly(t, <-done)
 }
