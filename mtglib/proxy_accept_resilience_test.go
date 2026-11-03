@@ -381,32 +381,28 @@ func (l *serveProbeListener) Accept() (net.Conn, error) {
 func (l *serveProbeListener) Close() error   { return nil }
 func (l *serveProbeListener) Addr() net.Addr { return &net.TCPAddr{} }
 
-func waitUntilProxyRefusesStreams(t *testing.T, proxy *mtglib.Proxy) {
-	t.Helper()
-
-	deadline := time.Now().Add(acceptResilienceDeadline)
-
+func proxyRefusesStreamsBefore(proxy *mtglib.Proxy, deadline time.Time) bool {
 	for time.Now().Before(deadline) {
 		probe := &serveProbeListener{}
 		proxy.Serve(probe) //nolint: errcheck
 
 		if probe.calls.Load() == 0 {
-			return
+			return true
 		}
 
 		time.Sleep(time.Millisecond)
 	}
 
-	t.Errorf("the proxy kept accepting new streams %s after Shutdown started", acceptResilienceDeadline)
+	return false
 }
 
 type acceptDuringShutdownListener struct {
 	net.Listener
 
-	t        *testing.T
-	proxy    *mtglib.Proxy
-	served   chan net.Conn
-	shutdown chan struct{}
+	proxy          *mtglib.Proxy
+	streamsRefused atomic.Bool
+	served         chan net.Conn
+	shutdown       chan struct{}
 }
 
 func (l *acceptDuringShutdownListener) Accept() (net.Conn, error) {
@@ -420,7 +416,7 @@ func (l *acceptDuringShutdownListener) Accept() (net.Conn, error) {
 		close(l.shutdown)
 	}()
 
-	waitUntilProxyRefusesStreams(l.t, l.proxy)
+	l.streamsRefused.Store(proxyRefusesStreamsBefore(l.proxy, time.Now().Add(acceptResilienceDeadline)))
 
 	l.served <- conn
 
@@ -438,7 +434,6 @@ func TestServeClosesConnectionAcceptedDuringShutdown(t *testing.T) {
 	proxy := newAcceptResilienceProxy(t)
 	listener := &acceptDuringShutdownListener{
 		Listener: inner,
-		t:        t,
 		proxy:    proxy,
 		served:   make(chan net.Conn, 1),
 		shutdown: make(chan struct{}),
@@ -467,6 +462,10 @@ func TestServeClosesConnectionAcceptedDuringShutdown(t *testing.T) {
 	case <-listener.shutdown:
 	case <-time.After(acceptResilienceDeadline):
 		t.Fatalf("Shutdown did not return within %s", acceptResilienceDeadline)
+	}
+
+	if !listener.streamsRefused.Load() {
+		t.Fatalf("the proxy kept accepting new streams %s after Shutdown started", acceptResilienceDeadline)
 	}
 
 	server := <-listener.served
