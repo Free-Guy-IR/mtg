@@ -160,6 +160,11 @@ func (p *Proxy) serveConn(conn essentials.Conn) {
 	ctx := newStreamContext(p.ctx, p.logger, conn)
 	defer ctx.Close()
 
+	if ctx.ClientIP() == nil {
+		ctx.logger.Info("connection was rejected: remote address has no tcp ip")
+		return
+	}
+
 	if err := ctx.clientConn.SetDeadline(time.Now().Add(p.handshakeTimeout)); err != nil {
 		ctx.logger.WarningError("cannot set handshake timeout", err)
 		return
@@ -258,7 +263,17 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			}
 		}
 
-		ipAddr := conn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+		remoteAddr := conn.RemoteAddr()
+
+		ipAddr := remoteTCPIP(remoteAddr)
+		if ipAddr == nil {
+			conn.Close() //nolint: errcheck
+			p.logger.BindStr("addr-type", fmt.Sprintf("%T", remoteAddr)).
+				Info("connection was rejected: remote address has no tcp ip")
+
+			continue
+		}
+
 		logger := p.logger.BindStr("ip", ipAddr.String())
 
 		if !p.allowlist.Contains(ipAddr) {

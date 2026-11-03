@@ -70,7 +70,16 @@ func (s *streamContext) telegramConnection() essentials.Conn {
 }
 
 func (s *streamContext) ClientIP() net.IP {
-	return s.acceptedConn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+	return remoteTCPIP(s.acceptedConn.RemoteAddr())
+}
+
+func remoteTCPIP(addr net.Addr) net.IP {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr == nil || len(tcpAddr.IP) == 0 {
+		return nil
+	}
+
+	return tcpAddr.IP
 }
 
 func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.Conn) *streamContext {
