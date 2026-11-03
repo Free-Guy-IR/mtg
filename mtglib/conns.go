@@ -79,7 +79,7 @@ func (c *connProxyProtocol) Write(p []byte) (int, error) {
 
 		toSend, err := headers.Format()
 		if err != nil {
-			panic(err)
+			return 0, fmt.Errorf("cannot build proxy protocol header: %w", err)
 		}
 
 		if _, err := c.Conn.Write(toSend); err != nil {
