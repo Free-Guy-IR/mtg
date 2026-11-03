@@ -263,35 +263,6 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			}
 		}
 
-		remoteAddr := conn.RemoteAddr()
-
-		ipAddr := remoteTCPIP(remoteAddr)
-		if ipAddr == nil {
-			conn.Close() //nolint: errcheck
-			p.logger.BindStr("addr-type", fmt.Sprintf("%T", remoteAddr)).
-				Info("connection was rejected: remote address has no tcp ip")
-
-			continue
-		}
-
-		logger := p.logger.BindStr("ip", ipAddr.String())
-
-		if !p.allowlist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was rejected by allowlist")
-			p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
-
-			continue
-		}
-
-		if p.blocklist.Contains(ipAddr) {
-			conn.Close() //nolint: errcheck
-			logger.Info("ip was blacklisted")
-			p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
-
-			continue
-		}
-
 		if !p.trackStream() {
 			conn.Close() //nolint: errcheck
 
@@ -310,12 +281,68 @@ func (p *Proxy) Serve(listener net.Listener) error {
 		case errors.Is(err, ants.ErrPoolClosed):
 			return nil
 		case errors.Is(err, ants.ErrPoolOverload):
-			logger.Info("connection was concurrency limited")
+			p.logger.Info("connection was concurrency limited")
 			p.eventStream.Send(p.ctx, NewEventConcurrencyLimited())
 		default:
-			logger.WarningError("cannot hand the connection to a worker", err)
+			p.logger.WarningError("cannot hand the connection to a worker", err)
 		}
 	}
+}
+
+func remoteAddrUntilDone(ctx context.Context, conn essentials.Conn) net.Addr {
+	resolved := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		ticker := time.NewTicker(pendingReadInterruptInterval)
+		defer ticker.Stop()
+
+		for {
+			conn.SetReadDeadline(time.Now()) //nolint: errcheck
+
+			select {
+			case <-resolved:
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	defer stop()
+	defer close(resolved)
+
+	return conn.RemoteAddr()
+}
+
+func (p *Proxy) admitConn(conn essentials.Conn) bool {
+	remoteAddr := remoteAddrUntilDone(p.ctx, conn)
+
+	ipAddr := remoteTCPIP(remoteAddr)
+	if ipAddr == nil {
+		conn.Close() //nolint: errcheck
+		p.logger.BindStr("addr-type", fmt.Sprintf("%T", remoteAddr)).
+			Info("connection was rejected: remote address has no tcp ip")
+
+		return false
+	}
+
+	logger := p.logger.BindStr("ip", ipAddr.String())
+
+	if !p.allowlist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was rejected by allowlist")
+		p.eventStream.Send(p.ctx, NewEventIPAllowlisted(ipAddr))
+
+		return false
+	}
+
+	if p.blocklist.Contains(ipAddr) {
+		conn.Close() //nolint: errcheck
+		logger.Info("ip was blacklisted")
+		p.eventStream.Send(p.ctx, NewEventIPBlocklisted(ipAddr))
+
+		return false
+	}
+
+	return true
 }
 
 // Shutdown 'gracefully' shutdowns all connections. Please remember that it
@@ -673,7 +700,10 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		func(arg any) {
 			defer proxy.streamWaitGroup.Done()
 
-			proxy.serveConn(arg.(essentials.Conn)) //nolint: forcetypeassert
+			conn := arg.(essentials.Conn) //nolint: forcetypeassert
+			if proxy.admitConn(conn) {
+				proxy.serveConn(conn)
+			}
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))

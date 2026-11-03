@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	acceptRetryDelayMin = 5 * time.Millisecond
-	acceptRetryDelayMax = time.Second
+	acceptRetryDelayMin          = 5 * time.Millisecond
+	acceptRetryDelayMax          = time.Second
+	pendingReadInterruptInterval = 10 * time.Millisecond
 )
 
 // isTemporaryAcceptError reports whether an Accept error is transient: the
