@@ -345,6 +345,14 @@ func TestServeAcceptErrorsInterleavedWithClientsAndShutdown(t *testing.T) {
 
 		stopProxy(t, proxy, listener, done)
 
+		close(listener.served)
+
+		for conn := range listener.served {
+			if _, err := conn.Write([]byte{0}); err == nil {
+				t.Errorf("round %d: Shutdown returned while an accepted connection was still open", round)
+			}
+		}
+
 		clients.Wait()
 		close(clientConns)
 
@@ -357,13 +365,113 @@ func TestServeAcceptErrorsInterleavedWithClientsAndShutdown(t *testing.T) {
 
 			conn.Close() //nolint: errcheck
 		}
+	}
+}
 
-		close(listener.served)
+type serveProbeListener struct {
+	calls atomic.Int64
+}
 
-		for conn := range listener.served {
-			if _, err := conn.Write([]byte{0}); err == nil {
-				t.Errorf("round %d: Shutdown returned while an accepted connection was still open", round)
-			}
+func (l *serveProbeListener) Accept() (net.Conn, error) {
+	l.calls.Add(1)
+
+	return nil, net.ErrClosed
+}
+
+func (l *serveProbeListener) Close() error   { return nil }
+func (l *serveProbeListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func waitUntilProxyRefusesStreams(t *testing.T, proxy *mtglib.Proxy) {
+	t.Helper()
+
+	deadline := time.Now().Add(acceptResilienceDeadline)
+
+	for time.Now().Before(deadline) {
+		probe := &serveProbeListener{}
+		proxy.Serve(probe) //nolint: errcheck
+
+		if probe.calls.Load() == 0 {
+			return
 		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Errorf("the proxy kept accepting new streams %s after Shutdown started", acceptResilienceDeadline)
+}
+
+type acceptDuringShutdownListener struct {
+	net.Listener
+
+	t        *testing.T
+	proxy    *mtglib.Proxy
+	served   chan net.Conn
+	shutdown chan struct{}
+}
+
+func (l *acceptDuringShutdownListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err //nolint: wrapcheck
+	}
+
+	go func() {
+		l.proxy.Shutdown()
+		close(l.shutdown)
+	}()
+
+	waitUntilProxyRefusesStreams(l.t, l.proxy)
+
+	l.served <- conn
+
+	return conn, nil
+}
+
+func TestServeClosesConnectionAcceptedDuringShutdown(t *testing.T) {
+	t.Parallel()
+
+	inner, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("cannot listen: %v", err)
+	}
+
+	proxy := newAcceptResilienceProxy(t)
+	listener := &acceptDuringShutdownListener{
+		Listener: inner,
+		t:        t,
+		proxy:    proxy,
+		served:   make(chan net.Conn, 1),
+		shutdown: make(chan struct{}),
+	}
+
+	t.Cleanup(func() { listener.Close() }) //nolint: errcheck
+
+	done := serveInBackground(proxy, listener)
+
+	client, err := net.DialTimeout("tcp", listener.Addr().String(), acceptResilienceDeadline)
+	if err != nil {
+		t.Fatalf("cannot dial: %v", err)
+	}
+	defer client.Close() //nolint: errcheck
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve must stop quietly when Shutdown starts during Accept, got %v", err)
+		}
+	case <-time.After(acceptResilienceDeadline):
+		t.Fatalf("Serve did not return within %s after Shutdown started", acceptResilienceDeadline)
+	}
+
+	select {
+	case <-listener.shutdown:
+	case <-time.After(acceptResilienceDeadline):
+		t.Fatalf("Shutdown did not return within %s", acceptResilienceDeadline)
+	}
+
+	server := <-listener.served
+
+	if _, err := server.Write([]byte{0}); err == nil {
+		t.Fatal("a connection accepted while the proxy was shutting down was left open")
 	}
 }

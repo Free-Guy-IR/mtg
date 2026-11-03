@@ -170,6 +170,43 @@ func (suite *ProxyTelegramCallTestSuite) TestUnknownDCWithoutFallback() {
 	suite.eventStreamMock.AssertNotCalled(suite.T(), "Send", mock.Anything, mock.Anything)
 }
 
+type plainModeNoReplay struct{}
+
+func (plainModeNoReplay) SeenBefore([]byte) bool { return false }
+
+func (suite *ProxyTelegramCallTestSuite) TestPlainModeHandshakeKeepsNegativeDC() {
+	secret := GenerateSecret("example.com")
+
+	suite.proxy.antiReplayCache = plainModeNoReplay{}
+	suite.proxy.UpdateSecrets(map[string]Secret{"media-user": secret})
+
+	clientSide, proxySide := net.Pipe()
+	deadline := time.Now().Add(telegramCallTestTimeout)
+	suite.Require().NoError(clientSide.SetDeadline(deadline))
+	suite.Require().NoError(proxySide.SetDeadline(deadline))
+	suite.T().Cleanup(func() {
+		clientSide.Close() //nolint: errcheck
+		proxySide.Close()  //nolint: errcheck
+	})
+
+	suite.ctx.clientConn = essentials.WrapNetConn(proxySide)
+
+	sent := make(chan error, 1)
+
+	go func() {
+		_, err := obfuscation.Obfuscator{Secret: secret.Key[:]}.SendHandshake(
+			essentials.WrapNetConn(clientSide), -2)
+		sent <- err
+	}()
+
+	suite.Require().NoError(suite.proxy.doPlainHandshake(suite.ctx))
+	suite.Require().NoError(<-sent)
+	suite.Equal("media-user", suite.ctx.secretID)
+	suite.Equal(-2, suite.ctx.dc)
+
+	suite.assertCall(suite.ctx.dc, -2)
+}
+
 func TestProxyTelegramCall(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ProxyTelegramCallTestSuite{})

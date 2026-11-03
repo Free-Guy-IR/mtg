@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -44,6 +45,24 @@ func (l *scriptedListener) Accept() (net.Conn, error) {
 
 func (l *scriptedListener) Close() error   { return nil }
 func (l *scriptedListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+type failingListener struct {
+	err      error
+	calls    atomic.Int64
+	notifyAt int64
+	notify   chan struct{}
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	if l.calls.Add(1) == l.notifyAt {
+		close(l.notify)
+	}
+
+	return nil, l.err
+}
+
+func (l *failingListener) Close() error   { return nil }
+func (l *failingListener) Addr() net.Addr { return &net.TCPAddr{} }
 
 func TestIsTemporaryAcceptError(t *testing.T) {
 	t.Parallel()
@@ -133,5 +152,74 @@ func TestAcceptWithRetryStopsOnShutdownDuringPause(t *testing.T) {
 
 	if time.Since(start) > time.Second {
 		t.Fatalf("shutdown must interrupt the retry pause, took %v", time.Since(start))
+	}
+}
+
+func TestAcceptWithRetryPausesBetweenTemporaryErrors(t *testing.T) {
+	t.Parallel()
+
+	listener := &failingListener{err: syscall.EMFILE}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if _, err := acceptWithRetry(ctx, listener, NoopLogger{}); err == nil {
+		t.Fatal("expected an error once the context is done")
+	}
+
+	calls := listener.calls.Load()
+	if calls < 2 {
+		t.Fatalf("EMFILE must be retried, got %d Accept calls in 300ms", calls)
+	}
+
+	if calls > 20 {
+		t.Fatalf("EMFILE must be retried after a pause, got %d Accept calls in 300ms", calls)
+	}
+}
+
+func TestAcceptWithRetryShutdownInterruptsTheLongestPause(t *testing.T) {
+	t.Parallel()
+
+	const firstCallBeforeOneSecondPause = 9
+
+	listener := &failingListener{
+		err:      syscall.EMFILE,
+		notifyAt: firstCallBeforeOneSecondPause,
+		notify:   make(chan struct{}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+
+	go func() {
+		_, err := acceptWithRetry(ctx, listener, NoopLogger{})
+		result <- err
+	}()
+
+	select {
+	case <-listener.notify:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Accept was not called %d times within 10s", firstCallBeforeOneSecondPause)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	cancelled := time.Now()
+
+	cancel()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected an error after shutdown")
+		}
+
+		if elapsed := time.Since(cancelled); elapsed > 250*time.Millisecond {
+			t.Fatalf("shutdown must interrupt the 1s retry pause, it returned after %v", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("acceptWithRetry did not return within 5s after shutdown")
 	}
 }
