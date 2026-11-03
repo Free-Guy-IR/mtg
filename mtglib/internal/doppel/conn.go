@@ -100,7 +100,7 @@ func (c Conn) takeWritten(buf []byte) int {
 
 func (c Conn) abandon() {
 	c.p.ctxCancel(errWriterPanicked)
-	c.Conn.Close() //nolint: errcheck
+	c.Close() //nolint: errcheck
 }
 
 func (c Conn) Stop() {

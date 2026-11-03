@@ -74,7 +74,7 @@ func TestConnProxyProtocolWriteMapsAnIPv4ClientForAnIPv6Target(t *testing.T) {
 		t.Fatalf("header carries no TCP addresses")
 	}
 
-	if !bytes.Equal(gotSource.IP.To16(), net.ParseIP("::ffff:192.0.2.10")) || gotSource.Port != sourceAddr.Port {
+	if !gotSource.IP.Equal(net.ParseIP("::ffff:192.0.2.10")) || gotSource.Port != sourceAddr.Port {
 		t.Fatalf("header source is %v, want the IPv4-mapped client [::ffff:192.0.2.10]:%d", gotSource, sourceAddr.Port)
 	}
 
