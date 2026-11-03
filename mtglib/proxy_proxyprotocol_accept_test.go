@@ -2,6 +2,7 @@ package mtglib_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"runtime/pprof"
@@ -402,4 +403,61 @@ func TestServeJudgesABlocklistedClientBeforeTheWorkerPool(t *testing.T) {
 	listener.Close() //nolint: errcheck
 	shutdownWithin(t, proxy, 2*pendingHeaderBudget)
 	assertServeEndedCleanly(t, <-done)
+}
+
+type gatedEvents struct {
+	recordingEvents
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedEvents) Send(ctx context.Context, evt mtglib.Event) {
+	if _, ok := evt.(mtglib.EventIPBlocklisted); ok {
+		close(g.entered)
+		<-g.release
+	}
+
+	g.recordingEvents.Send(ctx, evt)
+}
+
+func TestShutdownWaitsForTheRejectionEventOfAnAdmission(t *testing.T) {
+	stream := &gatedEvents{entered: make(chan struct{}), release: make(chan struct{})}
+	proxy := newProxyProtocolProxy(t, newRecordingAllowlist(), stream)
+	listener := newSignallingProxyProtocolListener(t)
+	done := serveRecovering(proxy, listener)
+	dst := &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+
+	sendRaw(t, listener.Addr(), proxyHeaderBytes(t, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 77), Port: 5000}, dst))
+
+	select {
+	case <-stream.entered:
+	case <-time.After(proxyProtocolDeadline):
+		t.Fatalf("the allowlist rejection event was never sent")
+	}
+
+	listener.Close() //nolint: errcheck
+	assertServeEndedCleanly(t, <-done)
+
+	shutdownDone := make(chan struct{})
+
+	go func() {
+		proxy.Shutdown()
+		close(shutdownDone)
+	}()
+
+	select {
+	case <-shutdownDone:
+		close(stream.release)
+		t.Fatalf("Shutdown returned while an admission was still sending its rejection event")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(stream.release)
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(proxyProtocolDeadline):
+		t.Fatalf("Shutdown did not return after the rejection event was sent")
+	}
 }
